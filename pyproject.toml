@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ce-agent"
+version = "0.1.0"
+description = "Terminal-native coding agent: plan/act/observe/recover loop over a sandboxed MCP tool surface."
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+tui = ["textual>=0.80"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+ce-agent = "ce_agent.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ce_agent*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

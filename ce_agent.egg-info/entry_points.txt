@@ -1,0 +1,2 @@
+[console_scripts]
+ce-agent = ce_agent.cli:main
