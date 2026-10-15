@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/dharmsingh/.claude/**)",
+      "Bash(npm ls *)"
+    ]
+  }
+}
