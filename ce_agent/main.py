@@ -3,92 +3,94 @@ The "raw" version of the agent.
 Everything is in this one file to make it easy to trace.
 """
 
-import subprocess
-import shutil
+import sys
 from pathlib import Path
 
-# --- 1. CONFIGURATION ---
+# ----------------------
+# 1️⃣  IMPORTS
+# ----------------------
+from ce_agent.sandbox_factory import sandbox_factory  # factory pattern
+
+
+# ----------------------
+# 2️⃣  CONFIGURATION
+# ----------------------
 def get_config():
     return {
         "sandbox_root": Path(".agent/sandbox"),
         "state_file": ".agent/state.json",
-        "turn_limit": 50
+        "turn_limit": 50,
     }
 
-# --- 2. SANDBOX (The isolation contract) ---
-def create_sandbox(repo_path, task_id):
-    print("path from create sandbox : " ,repo_path)
-    sandbox_path = Path(f".agent/worktrees/{task_id}")
-    sandbox_path.mkdir(parents=True, exist_ok=True)
 
-    # IMPORTANT: Ignore our own control directory to prevent infinite recursion
-    def ignore_func(dir, files):
-        return [".agent", ".git"]
+# ----------------------
+# 3️⃣  TOOLS (Our tool surface)
+# ----------------------
+def tool_read_file(sandbox, file_path):
+    """Read a file using the sandbox's read_file method."""
+    return sandbox.read_file(file_path)
 
-    shutil.copytree(repo_path, sandbox_path, dirs_exist_ok=True, ignore=ignore_func)
-    print("sandbox path :" , sandbox_path)
-    return sandbox_path
 
-def run_in_sandbox(sandbox_path, command):
-    # This is how we run tools INSIDE the sandbox.
-    # cwd=sandbox_path is the key -- the tool cannot "see" outside.
-    return subprocess.run(
-        command,
-        cwd=sandbox_path,
-        capture_output=True,
-        text=True,
-        shell=True
-    )
+def tool_list_files(sandbox):
+    """List files using the sandbox's list_files method."""
+    return sandbox.list_files()
 
-# --- 3. TOOLS (Our tool surface) ---
-def tool_read_file(sandbox_path, file_path):
-    full_path = sandbox_path / file_path
-    # Security check: ensure file is inside sandbox
-    try:
-        full_path.resolve().relative_to(sandbox_path.resolve())
-    except ValueError:
-        return "Error: Access denied (file outside sandbox)"
 
-    if not full_path.exists():
-        return f"Error: File {file_path} not found"
-    return full_path.read_text()
+def tool_run_shell(sandbox, command):
+    """Run a shell command using the sandbox's run method."""
+    return sandbox.run(command)
 
-def tool_list_files(sandbox_path):
-    return "\n".join([str(p.relative_to(sandbox_path)) for p in sandbox_path.rglob("*")])
 
-def tool_run_shell(sandbox_path, command):
-    """A dedicated tool for running shell commands with capture."""
-    return run_in_sandbox(sandbox_path, command)
+# ----------------------
+# 4️⃣  DISPATCHER
+# ----------------------
+def dispatch(sandbox, command_str):
+    """Mini-MCP dispatcher: routes commands to the appropriate tool.
 
-# --- 4. DISPATCHER ---
-def dispatch(sandbox_path, command_str):
-    # This acts as our mini-MCP dispatcher
-    # Returns a dict: {"status": "ok"|"error", "content": "..."}
+    Args:
+        sandbox: the sandbox object (has .read_file(), .list_files(), .run() methods)
+        command_str: the command string (e.g., "read file", "ls", "shell cmd")
+    """
+    # Returns a dict: {"status": "ok"|"error", "content": str, "error": str|None}
 
     if command_str.startswith("read "):
         file_path = command_str.replace("read ", "").strip()
-        content = tool_read_file(sandbox_path, file_path)
+        content = tool_read_file(sandbox, file_path)
         if content.startswith("Error:"):
             return {"status": "error", "content": content}
         return {"status": "ok", "content": content}
     elif command_str == "ls":
-        content = tool_list_files(sandbox_path)
+        content = tool_list_files(sandbox)
         return {"status": "ok", "content": content}
     elif command_str.startswith("shell "):
         cmd = command_str.replace("shell ", "").strip()
-        result = tool_run_shell(sandbox_path, cmd)
-        return {"status": "ok" if result.returncode == 0 else "error",
-                "content": result.stdout, "error": result.stderr}
+        # Use the sandbox object's run method (polymorphic - works for Docker or local)
+        result = tool_run_shell(sandbox, cmd)
+        # Normalise the result dict to our expected shape
+        return {
+            "status": "ok" if result.get("status") == "ok" else "error",
+            "content": result.get("content", ""),
+            "error": result.get("error", ""),
+        }
     else:
-        # Fallback: run the raw shell command
-        result = run_in_sandbox(sandbox_path, command_str)
-        return {"status": "ok" if result.returncode == 0 else "error",
-                "content": result.stdout, "error": result.stderr}
+        # Fallback: run the raw shell command via sandbox
+        result = tool_run_shell(sandbox, command_str)
+        return {
+            "status": "ok" if result.get("status") == "ok" else "error",
+            "content": result.get("content", ""),
+            "error": result.get("error", ""),
+        }
 
-# --- 5. THE LOOP (Plan, Act, Observe, Recover) ---
-def run_agent(repo_path, task):
-    config = get_config()
-    sandbox = create_sandbox(repo_path, "task_1")
+
+# ----------------------
+# 5️⃣  THE LOOP (Plan, Act, Observe, Recover)
+# ----------------------
+def run_agent(repo_path: str, task: str):
+    # ---- Initialise sandbox via factory ----
+    sandbox = sandbox_factory()  # auto-detects Docker vs local
+    sandbox_dir = sandbox.setup(
+        repo_path, "task_1"
+    )  # prepares isolated dir, returns Path string (may be unused for some backends)
 
     print(f"--- Starting loop for task: {task} ---")
 
@@ -99,10 +101,13 @@ def run_agent(repo_path, task):
         "task": task,
         "steps": ["ls", "read Readme.md"],  # Initial plan
         "done": [],
-        "summary": ""  # Will be built up each turn
+        "summary": "",  # Will be built up each turn
     }
 
-    for turn in range(config["turn_limit"]):
+    cfg = get_config()
+    turn_limit = cfg["turn_limit"] if cfg else 50
+
+    for turn in range(turn_limit):
         if not plan["steps"]:
             print("\n[Plan] No more steps. Task appears complete.")
             break
@@ -128,7 +133,7 @@ def run_agent(repo_path, task):
         print(f"[Plan] Summary so far: {plan['summary'][:100]}...")
 
         # --- ACT & OBSERVE ---
-        result = dispatch(sandbox, current_step)
+        result = dispatch(sandbox, current_step)  # <-- uses sandbox methods internally
 
         # --- RECOVER (Error Handling) ---
         if result["status"] == "error":
@@ -138,7 +143,9 @@ def run_agent(repo_path, task):
             plan["done"].append(current_step)
             # Rewrite the plan: remove this step, maybe add a retry or skip
             plan["steps"] = [s for s in plan["steps"] if s != current_step]
-            plan["summary"] += f"\nTurn {turn}: Error on '{current_step}' — removed from plan."
+            plan[
+                "summary"
+            ] += f"\nTurn {turn}: Error on '{current_step}' — removed from plan."
             # Continue to next turn; the loop will pick the next remaining step
             continue
 
@@ -148,7 +155,9 @@ def run_agent(repo_path, task):
 
         # Update plan state
         plan["done"].append(current_step)
-        plan["summary"] += f"\nTurn {turn}: completed '{current_step}'. Output: {output[:50]}..."
+        plan[
+            "summary"
+        ] += f"\nTurn {turn}: completed '{current_step}'. Output: {output[:50]}..."
 
         # --- PLAN REWRITING DECISION ---
         # In a real model-driven loop, the model would look at the observation
@@ -165,13 +174,15 @@ def run_agent(repo_path, task):
 
     print("\n--- Loop finished ---")
 
-    # Cleanup
-    shutil.rmtree(sandbox, ignore_errors=True)
+    # ---- Teardown ----
+    sandbox.teardown()
     print("Sandbox cleaned up.")
 
-# --- 6. CLI ---
+
+# ----------------------
+# 6️⃣  CLI
+# ----------------------
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) < 3:
         print("Usage: python main.py <repo_path> <task>")
     else:
