@@ -1,8 +1,10 @@
-"""ce-agent: a terminal-native coding agent.
+"""ce-agent: a small terminal coding agent, built to learn how agents work.
 
-A plan / act / observe / recover loop over a sandboxed MCP tool surface.
-Every surface from the capstone spec is a real, runnable module — see
-``ce_agent/`` for the layout, and the phase notes in the project README.
+brain.py      talks to the LLM (any OpenAI-compatible API)
+tools.py      the tools the model can call
+registry.py   turns Python functions into tool schemas
+workspace.py  git worktree + Docker sandbox, with accept / reject / keep
+main.py       the loop: think -> act -> observe -> repeat
 """
 
 __version__ = "0.1.0"

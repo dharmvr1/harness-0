@@ -3,3 +3,4 @@ PLAN.md
 METHODOLOGY.md
 .agent/
 __pycache__/
+*.egg-info/

@@ -1,7 +1,10 @@
 """Tests for Workspace. Needs git; the Docker tests are skipped if Docker is not running."""
 import subprocess
 import pytest
-from ce_agent.workspace import Workspace
+from ce_agent.workspace import Workspace, recover
+
+def branches(repo):
+    return subprocess.run(["git", "branch"], cwd=repo, capture_output=True, text=True).stdout
 
 def sh(*cmd, cwd):
     subprocess.run(cmd, cwd=cwd, check=True, capture_output=True)
@@ -26,10 +29,11 @@ def test_unsafe_edit_reject_leaves_repo_untouched(repo):
     ws.write_file("calc.py", "print(2 + 2)\n")
     assert "4" in ws.run("python3 calc.py")["stdout"]
     assert "2 + 2" in ws.finish()
+    ws.discard()
     ws.cleanup()
     assert (repo / "calc.py").read_text() == "print(1 + 1)\n"      # real repo untouched
     assert not (repo / ".agent" / "worktrees" / ws.task_id).exists()  # worktree gone
-    assert ws.branch not in subprocess.run(["git", "branch"], cwd=repo, capture_output=True, text=True).stdout
+    assert ws.branch not in branches(repo)
 
 def test_accept_merges_into_real_repo(repo):
     ws = Workspace(str(repo), unsafe=True)
@@ -73,3 +77,63 @@ def test_docker_blocks_network_and_runs_as_you(repo):
     names = subprocess.run(["docker", "ps", "-a", "--filter", "label=ce_agent=true", "-q"],
                            capture_output=True, text=True).stdout
     assert ws.container is None and names.strip() == ""                    # container removed
+
+
+def test_crash_keeps_uncommitted_work_on_branch(repo):
+    ws = Workspace(str(repo), unsafe=True)
+    ws.start()
+    ws.write_file("half_done.py", "x = 1\n")      # agent wrote something, then we "crash": no finish() call
+    ws.cleanup()
+    assert ws.branch in branches(repo)
+    show = subprocess.run(["git", "show", f"{ws.branch}:half_done.py"], cwd=repo, capture_output=True, text=True)
+    assert show.stdout == "x = 1\n"
+    assert not (repo / "half_done.py").exists()                       # real repo still untouched
+
+def test_branch_with_no_work_is_not_left_behind(repo):
+    ws = Workspace(str(repo), unsafe=True)
+    ws.start()
+    ws.cleanup()
+    assert ws.branch not in branches(repo)
+
+def test_failed_merge_keeps_branch(repo):
+    ws = Workspace(str(repo), unsafe=True)
+    ws.start()
+    ws.write_file("calc.py", "print('agent')\n")
+    ws.finish()
+    (repo / "calc.py").write_text("print('me')\n")                   # conflicting commit on main
+    sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "mine", cwd=repo)
+    assert "failed" in ws.accept()
+    ws.cleanup()
+    assert ws.branch in branches(repo)
+    assert (repo / "calc.py").read_text() == "print('me')\n"          # merge was aborted cleanly
+
+def test_two_tasks_at_once_on_repo_root_without_gitignore(repo):
+    (repo / ".gitignore").unlink()
+    sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "no gitignore", cwd=repo)
+    a, b = Workspace(str(repo), unsafe=True), Workspace(str(repo), unsafe=True)
+    a.start()
+    try:
+        b.start()                       # would be refused as "uncommitted changes" if .agent/ showed up in git status
+        b.discard(); b.cleanup()
+    finally:
+        a.discard(); a.cleanup()
+
+def test_unsafe_mode_hides_api_keys(repo, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "super-secret")
+    ws = Workspace(str(repo), unsafe=True)
+    ws.start()
+    try:
+        assert "super-secret" not in ws.run("env")["stdout"]
+    finally:
+        ws.discard(); ws.cleanup()
+
+def test_recover_saves_leftover_worktree(repo):
+    ws = Workspace(str(repo), unsafe=True)
+    ws.start()
+    ws.write_file("lost.py", "x = 1\n")
+    # simulate a hard kill: cleanup() never runs, then the user runs --cleanup
+    out = recover(str(repo))
+    assert ws.branch in out and ws.branch in branches(repo)
+    assert not ws.worktree.exists()
+    show = subprocess.run(["git", "show", f"{ws.branch}:lost.py"], cwd=repo, capture_output=True, text=True)
+    assert show.stdout == "x = 1\n"

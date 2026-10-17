@@ -37,7 +37,10 @@ class Registry:
                 hint = args[0]
 
             params[name] = {"type": JSON_TYPES.get(hint, "string"), "description": desc}
-        return {"type": "object", "properties": params, "required": list(params)}
+        # Parameters with a default value (e.g. start_line: int = 1) are optional
+        sig = inspect.signature(func).parameters
+        required = [n for n in params if sig[n].default is inspect.Parameter.empty]
+        return {"type": "object", "properties": params, "required": required}
 
     def get_tool_list(self):
         """Return schema for all tools (for the LLM)."""
@@ -56,6 +59,16 @@ class Registry:
         """Execute a tool call with validation."""
         if name not in self.tools:
             return {"status": "error", "error": f"Tool {name} not found"}
+
+        # Models are sloppy: they send null for optional args and numbers as strings. Fix both.
+        props = self.tools[name]["schema"]["properties"]
+        kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        for k, v in kwargs.items():
+            if props.get(k, {}).get("type") == "integer" and isinstance(v, str):
+                try:
+                    kwargs[k] = int(v)
+                except ValueError:
+                    return {"status": "error", "error": f"{k} must be a whole number, got '{v}'"}
 
         try:
             result = self.tools[name]["func"](**kwargs)
