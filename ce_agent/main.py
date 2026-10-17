@@ -1,189 +1,123 @@
 """
-The "raw" version of the agent.
-Everything is in this one file to make it easy to trace.
+The agent loop: think (LLM) -> act (tool) -> observe (result) -> repeat.
 """
 
+import json
 import sys
-from pathlib import Path
+from typing import Annotated
+
+from ce_agent.workspace import Workspace
+from ce_agent.registry import Registry
+from ce_agent.brain import Brain, SYSTEM_PROMPT
 
 # ----------------------
-# 1️⃣  IMPORTS
+# 1️⃣ TOOLS WITH TYPE HINTS & ANNOTATIONS
 # ----------------------
-from ce_agent.sandbox_factory import sandbox_factory  # factory pattern
+def make_tools(ws):
+    """Build the tools, bound to one workspace. Errors are raised and the registry reports them."""
 
+    def read_file(file_path: Annotated[str, "Path of the file to read, relative to the workspace"]):
+        return ws.read_file(file_path)
 
-# ----------------------
-# 2️⃣  CONFIGURATION
-# ----------------------
-def get_config():
-    return {
-        "sandbox_root": Path(".agent/sandbox"),
-        "state_file": ".agent/state.json",
-        "turn_limit": 50,
-    }
+    def write_file(file_path: Annotated[str, "Path of the file to create or overwrite"],
+                   content: Annotated[str, "Full new content of the file"]):
+        return ws.write_file(file_path, content)
 
+    def list_files():
+        return ws.list_files()
 
-# ----------------------
-# 3️⃣  TOOLS (Our tool surface)
-# ----------------------
-def tool_read_file(sandbox, file_path):
-    """Read a file using the sandbox's read_file method."""
-    return sandbox.read_file(file_path)
+    def run_shell(command: Annotated[str, "Shell command to run in the workspace"]):
+        r = ws.run(command)
+        # Give the model everything: exit code and both output streams
+        return f"exit code: {r['exit_code']}\n--- stdout ---\n{r['stdout']}\n--- stderr ---\n{r['stderr']}"
 
-
-def tool_list_files(sandbox):
-    """List files using the sandbox's list_files method."""
-    return sandbox.list_files()
-
-
-def tool_run_shell(sandbox, command):
-    """Run a shell command using the sandbox's run method."""
-    return sandbox.run(command)
-
+    return read_file, write_file, list_files, run_shell
 
 # ----------------------
-# 4️⃣  DISPATCHER
+# 2️⃣ MAIN LOOP
 # ----------------------
-def dispatch(sandbox, command_str):
-    """Mini-MCP dispatcher: routes commands to the appropriate tool.
+MAX_TURNS = 20          # hard stop so the agent can never loop forever
+MAX_OUTPUT_CHARS = 4000  # cut long tool output so it does not flood the context
 
-    Args:
-        sandbox: the sandbox object (has .read_file(), .list_files(), .run() methods)
-        command_str: the command string (e.g., "read file", "ls", "shell cmd")
-    """
-    # Returns a dict: {"status": "ok"|"error", "content": str, "error": str|None}
+def run_agent(repo_path: str, task: str, unsafe: bool = False, network: bool = False):
+    if unsafe:
+        print("!!! UNSAFE MODE: commands run directly on your machine, with no container. !!!")
+    ws = Workspace(repo_path, unsafe=unsafe, network=network)
+    ws.start()
+    brain = Brain()
 
-    if command_str.startswith("read "):
-        file_path = command_str.replace("read ", "").strip()
-        content = tool_read_file(sandbox, file_path)
-        if content.startswith("Error:"):
-            return {"status": "error", "content": content}
-        return {"status": "ok", "content": content}
-    elif command_str == "ls":
-        content = tool_list_files(sandbox)
-        return {"status": "ok", "content": content}
-    elif command_str.startswith("shell "):
-        cmd = command_str.replace("shell ", "").strip()
-        # Use the sandbox object's run method (polymorphic - works for Docker or local)
-        result = tool_run_shell(sandbox, cmd)
-        # Normalise the result dict to our expected shape
-        return {
-            "status": "ok" if result.get("status") == "ok" else "error",
-            "content": result.get("content", ""),
-            "error": result.get("error", ""),
-        }
-    else:
-        # Fallback: run the raw shell command via sandbox
-        result = tool_run_shell(sandbox, command_str)
-        return {
-            "status": "ok" if result.get("status") == "ok" else "error",
-            "content": result.get("content", ""),
-            "error": result.get("error", ""),
-        }
+    # Register tools (schema is auto-generated from type hints)
+    registry = Registry()
+    read_file, write_file, list_files, run_shell = make_tools(ws)
+    registry.register(read_file, "Read a file from the workspace")
+    registry.register(write_file, "Create or overwrite a file in the workspace")
+    registry.register(list_files, "List all files in the workspace workspace")
+    registry.register(run_shell, "Run a shell command in the workspace")
+    tools = registry.get_openai_tools()
 
+    print(f"--- Task: {task} (model: {brain.model}) ---")
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": task},
+    ]
 
-# ----------------------
-# 5️⃣  THE LOOP (Plan, Act, Observe, Recover)
-# ----------------------
-def run_agent(repo_path: str, task: str):
-    # ---- Initialise sandbox via factory ----
-    sandbox = sandbox_factory()  # auto-detects Docker vs local
-    sandbox_dir = sandbox.setup(
-        repo_path, "task_1"
-    )  # prepares isolated dir, returns Path string (may be unused for some backends)
+    try:
+        for turn in range(MAX_TURNS):
+            # THINK: ask the model what to do next
+            reply = brain.think(messages, tools)
+            messages.append(reply)
 
-    print(f"--- Starting loop for task: {task} ---")
+            # No tool calls means the model thinks it is done
+            if not reply.tool_calls:
+                print(f"\n[Done] {reply.content}")
+                break
 
-    # --- THE PLAN STATE ---
-    # In Phase 3, this is rewritten each turn.
-    # Currently we initialize it once, but the loop body decides next steps.
-    plan = {
-        "task": task,
-        "steps": ["ls", "read Readme.md"],  # Initial plan
-        "done": [],
-        "summary": "",  # Will be built up each turn
-    }
+            # ACT + OBSERVE: run each tool the model asked for
+            for call in reply.tool_calls:
+                name = call.function.name
+                try:
+                    args = json.loads(call.function.arguments)
+                except json.JSONDecodeError:
+                    result = {"status": "error", "error": "Arguments were not valid JSON"}
+                else:
+                    print(f"\n[Turn {turn}] {name}({args})")
+                    result = registry.call(name, args)
 
-    cfg = get_config()
-    turn_limit = cfg["turn_limit"] if cfg else 50
+                # RECOVER: errors go back to the model as text so it can fix itself
+                if result["status"] == "ok":
+                    text = result["content"]
+                else:
+                    text = "ERROR: " + result["error"]
+                print(text[:300])
 
-    for turn in range(turn_limit):
-        if not plan["steps"]:
-            print("\n[Plan] No more steps. Task appears complete.")
-            break
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": text[:MAX_OUTPUT_CHARS],
+                })
+        else:
+            print(f"\n[Stopped] hit the {MAX_TURNS}-turn limit")
 
-        # --- PLAN REWRITING (Phase 3) ---
-        # In a real system, the model would rewrite the full `plan` dict each turn.
-        # Here we simulate it: after acting, we re-evaluate what's left.
-        remaining = [s for s in plan["steps"] if s not in plan["done"]]
-
-        if not remaining:
-            print("\n[Plan] All steps completed.")
-            break
-
-        # For the first turn, pick the first step.
-        # Later, this would be determined by reading the model's rewritten plan.
-        current_step = remaining[0] if remaining else None
-
-        if current_step is None:
-            break
-
-        print(f"\n--- Turn {turn} ---")
-        print(f"[Plan] Current step: {current_step}")
-        print(f"[Plan] Summary so far: {plan['summary'][:100]}...")
-
-        # --- ACT & OBSERVE ---
-        result = dispatch(sandbox, current_step)  # <-- uses sandbox methods internally
-
-        # --- RECOVER (Error Handling) ---
-        if result["status"] == "error":
-            error_msg = result.get("error", result.get("content", "Unknown error"))
-            print(f"[ERROR] Tool failed: {error_msg[:200]}")
-            # Record in plan that this step failed/fixed
-            plan["done"].append(current_step)
-            # Rewrite the plan: remove this step, maybe add a retry or skip
-            plan["steps"] = [s for s in plan["steps"] if s != current_step]
-            plan[
-                "summary"
-            ] += f"\nTurn {turn}: Error on '{current_step}' — removed from plan."
-            # Continue to next turn; the loop will pick the next remaining step
-            continue
-
-        # --- OBSERVE ---
-        output = result["content"][:300]  # Truncate for display
-        print(f"[Output] {output}")
-
-        # Update plan state
-        plan["done"].append(current_step)
-        plan[
-            "summary"
-        ] += f"\nTurn {turn}: completed '{current_step}'. Output: {output[:50]}..."
-
-        # --- PLAN REWRITING DECISION ---
-        # In a real model-driven loop, the model would look at the observation
-        # and decide the next step. Here we just have simple logic:
-        # If we just read the Readme, maybe we're done? Or maybe we should list more files?
-        if "Readme.md" in current_step and turn >= 1:
-            # After reading the readme, the "plan" might shift to exploring more
-            if "ls" in plan["steps"] and "ls" not in plan["done"]:
-                print("[Plan] Noticing we haven't done a full directory listing yet...")
+        # Commit the agent's work on its own branch and let the human decide
+        diff = ws.finish()
+        print("\n--- Changes made by the agent ---")
+        print(diff[:3000] if diff else "No changes made")
+        if diff:
+            choice = input(f"\n[a]ccept (merge into your repo) / [r]eject / [k]eep branch {ws.branch}: ").lower()
+            if choice == "a":
+                print(ws.accept())
+            elif choice == "k":
+                print(ws.keep())
             else:
-                print("[Plan] Shifting: Readme read, now exploring with 'ls -R'...")
-                # Add a new step to the plan dynamically
-                plan["steps"].append("ls -R")
-
+                print("Rejected. Your repo was not touched.")
+    finally:
+        ws.cleanup()  # always remove container + worktree, even on errors
     print("\n--- Loop finished ---")
 
-    # ---- Teardown ----
-    sandbox.teardown()
-    print("Sandbox cleaned up.")
-
-
-# ----------------------
-# 6️⃣  CLI
-# ----------------------
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python main.py <repo_path> <task>")
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(args) != 2:
+        print("Usage: python -m ce_agent.main <repo_path> <task> [--unsafe-local] [--network]")
     else:
-        run_agent(sys.argv[1], sys.argv[2])
+        run_agent(args[0], args[1], unsafe="--unsafe-local" in flags, network="--network" in flags)
