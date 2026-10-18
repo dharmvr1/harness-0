@@ -35,12 +35,12 @@ def test_unsafe_edit_reject_leaves_repo_untouched(repo):
     assert not (repo / ".agent" / "worktrees" / ws.task_id).exists()  # worktree gone
     assert ws.branch not in branches(repo)
 
-def test_accept_merges_into_real_repo(repo):
+def test_accept_applies_changes_to_the_real_folder(repo):
     ws = Workspace(str(repo), unsafe=True)
     ws.start()
     ws.write_file("new.py", "x = 1\n")
     ws.finish()
-    assert "Merged" in ws.accept()
+    assert "Applied" in ws.accept()
     ws.cleanup()
     assert (repo / "new.py").exists()
 
@@ -55,10 +55,6 @@ def test_path_escape_blocked(repo):
     finally:
         ws.cleanup()
 
-def test_dirty_folder_refused(repo):
-    (repo / "uncommitted.py").write_text("x\n")
-    with pytest.raises(RuntimeError, match="Uncommitted"):
-        Workspace(str(repo), unsafe=True).start()
 
 @needs_docker
 def test_docker_blocks_network_and_runs_as_you(repo):
@@ -95,17 +91,17 @@ def test_branch_with_no_work_is_not_left_behind(repo):
     ws.cleanup()
     assert ws.branch not in branches(repo)
 
-def test_failed_merge_keeps_branch(repo):
+def test_patch_that_does_not_fit_changes_nothing_and_keeps_the_branch(repo):
     ws = Workspace(str(repo), unsafe=True)
     ws.start()
     ws.write_file("calc.py", "print('agent')\n")
     ws.finish()
-    (repo / "calc.py").write_text("print('me')\n")                   # conflicting commit on main
-    sh("git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "mine", cwd=repo)
-    assert "failed" in ws.accept()
+    (repo / "calc.py").write_text("print('me')\n")                   # you edit the same lines meanwhile
+    assert "Could not apply" in ws.accept()
     ws.cleanup()
     assert ws.branch in branches(repo)
-    assert (repo / "calc.py").read_text() == "print('me')\n"          # merge was aborted cleanly
+    assert (repo / "calc.py").read_text() == "print('me')\n"          # your file was not touched
+    assert (repo / ".agent" / "patches" / f"{ws.task_id}.patch").exists()   # the patch is saved for you
 
 def test_two_tasks_at_once_on_repo_root_without_gitignore(repo):
     (repo / ".gitignore").unlink()

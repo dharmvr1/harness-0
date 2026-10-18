@@ -4,8 +4,9 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
-from ce_agent import main as agent
-from ce_agent.main import shorten, run_agent
+import ce_agent.session as session_module
+from ce_agent.context import shorten
+from ce_agent.main import run_agent
 
 
 def sh(*cmd, cwd):
@@ -103,7 +104,7 @@ def test_bad_tool_calls_do_not_crash_the_loop(repo, monkeypatch):
 
 
 def test_turn_limit_stops_a_looping_agent(repo, monkeypatch):
-    monkeypatch.setattr(agent, "MAX_TURNS", 3)
+    monkeypatch.setattr(session_module, "MAX_TURNS", 3)
     brain = FakeBrain(*[tool_call("list_files") for _ in range(10)])
     answer(monkeypatch)
     run_agent(str(repo), "t", unsafe=True, brain=brain)

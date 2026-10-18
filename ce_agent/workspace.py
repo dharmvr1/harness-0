@@ -1,39 +1,68 @@
 """
 Workspace: where the agent does its work.
 
-  - Files live in a git worktree on a fresh branch (agent/<id>), so your real
-    folder is never touched while the agent works.
-  - Shell commands run inside a Docker container that mounts that worktree
+  - The agent works in a git worktree on its own branch (agent/<id>), a copy that starts from a SNAPSHOT of your
+    folder as it is right now: committed files, uncommitted edits and new files (minus what .gitignore hides).
+    So the agent sees what you see, and your real folder is never touched while it works.
+  - Shell commands run inside a Docker container that mounts that copy
     (or directly on your machine in --unsafe-local mode).
-  - Nothing reaches your real branch until you call accept().
-  - The agent's work is never thrown away by accident: cleanup() saves it on
-    its branch unless you called discard() or accept() succeeded.
+  - Nothing reaches your folder until you call accept(), which applies only the agent's changes to your files
+    as a patch. They arrive as ordinary uncommitted edits; you commit them when you like.
+  - The agent's work is never thrown away by accident: cleanup() keeps the branch if anything is still pending.
 
 All git commands run on the host, never inside the container.
 """
 
 import os
+import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 
 DEFAULT_IMAGE = "python:3.11-slim"
+NOTES_FILE = "AGENTS.md"
+NOTES_MAX_CHARS = 2000   # the notes are pasted into every prompt, so they must stay short
+NOTE_MAX_CHARS = 300
 
 
-def git(*args, cwd):
+def git(*args, cwd, env=None):
     """Run a git command, return its output, raise with git's message on failure."""
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
     return r.stdout
 
 
 def commit_all(path, message):
-    """Commit everything in a worktree (does nothing if there are no changes)."""
+    """Commit everything in a worktree. Returns True if there was something to commit."""
     git("add", "-A", cwd=path)
     if git("status", "--porcelain", cwd=path):
         git("-c", "user.name=ce-agent", "-c", "user.email=ce-agent@localhost",
             "commit", "-m", message, cwd=path)
+        return True
+    return False
+
+
+def ensure_repo(repo_path: str, ask=None):
+    """Make sure repo_path is inside a git repo (the agent's copy is a git worktree). A missing folder or a folder
+    that is not a repo yet is set up after asking. No commit is made and none of your files are touched."""
+    ask = ask or input
+    path = Path(repo_path).expanduser().resolve()
+
+    def confirm(question):
+        if ask(f"{question} [y/N] ").strip().lower() != "y":
+            raise RuntimeError("Cancelled. The agent needs a git repo to work in.")
+
+    if not path.exists():
+        confirm(f"{path} does not exist. Create it as a new git project?")
+        path.mkdir(parents=True)
+        git("init", cwd=path)
+        print(f"Created {path} and ran git init.")
+    elif subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=path, capture_output=True).returncode != 0:
+        confirm(f"{path} is not a git repo. Run git init here? (No commit is made, your files stay as they are.)")
+        git("init", cwd=path)
+        print(f"Ran git init in {path}.")
 
 
 class Workspace:
@@ -50,15 +79,34 @@ class Workspace:
         self.workdir = None       # worktree + the sub-folder we were pointed at
         # Safe by default: the branch survives cleanup() unless discard() or a successful accept() says otherwise
         self.keep_branch = True
+        self.last_sync_changes = []   # files the latest sync() brought in, as "M\tpath" / "A\tpath" / "D\tpath"
+        self.prefix = ""              # the sub-folder we were pointed at, e.g. "sandbox_testing/"
+        self.attached = False         # True: a view of someone else's worktree (see attach())
 
     # ------------------------------------------------------------------
     # start / cleanup
     # ------------------------------------------------------------------
+    @classmethod
+    def attach(cls, worktree, prefix="", container=None):
+        """A Workspace over an EXISTING worktree (and container), for the MCP server process.
+        Only the file and command operations work: the harness owns the lifecycle (start, sync, review,
+        accept, cleanup), so start() and cleanup() are refused here. Without a container, commands run on the host."""
+        ws = cls(str(worktree), unsafe=container is None)
+        ws.worktree = Path(worktree).resolve()
+        ws.prefix = prefix
+        ws.workdir = ws.worktree / prefix
+        ws.container = container
+        ws.attached = True
+        return ws
+
     def start(self):
+        if self.attached:
+            raise RuntimeError("An attached workspace is owned by the harness; it cannot be started here")
         # Find the git repo that contains repo_path (it may be a sub-folder of it)
         top = Path(git("rev-parse", "--show-toplevel", cwd=self.repo_path).strip())
         prefix = git("rev-parse", "--show-prefix", cwd=self.repo_path).strip()  # e.g. "sandbox_testing/"
         self.top = top
+        self.prefix = prefix
 
         # Hide .agent/ from git for this repo only (not committed), so worktrees never look like "changes"
         exclude = top / git("rev-parse", "--git-path", "info/exclude", cwd=top).strip()
@@ -67,19 +115,18 @@ class Workspace:
             with open(exclude, "a") as f:
                 f.write("\n.agent/\n")
 
-        # A worktree starts from the last commit, so uncommitted work would be invisible to the agent
-        dirty = git("status", "--porcelain", "--", ".", cwd=self.repo_path)
-        if dirty:
-            raise RuntimeError("Uncommitted changes in this folder; the agent can't see them. "
-                               "Commit or stash first:\n" + dirty)
-
         if not self.unsafe and not self._docker_ok():
             raise RuntimeError("Docker is not available. Start Docker, or pass --unsafe-local "
                                "to run commands directly on your machine.")
 
-        self.base = git("rev-parse", "HEAD", cwd=top).strip()
+        # The agent's copy starts from a snapshot of your folder as it is now (uncommitted work included)
+        head = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=top,
+                              capture_output=True, text=True).stdout.strip() or None   # None: repo has no commits yet
+        self.base = head or ""
+        self.uncommitted = git("status", "--porcelain", "--untracked-files=all", cwd=top).rstrip()
+        self.mark = self._snapshot(head)   # the state of your folder that the agent's copy is based on
         self.worktree = top / ".agent" / "worktrees" / self.task_id
-        git("worktree", "add", "-b", self.branch, str(self.worktree), cwd=top)
+        git("worktree", "add", "-b", self.branch, str(self.worktree), self.mark, cwd=top)
         self.workdir = self.worktree / prefix
 
         if not self.unsafe:
@@ -119,12 +166,14 @@ class Workspace:
 
     def cleanup(self):
         """Remove container and worktree. The branch stays if it holds work. Safe to call twice."""
+        if self.attached:
+            return   # not ours to remove
         # Save anything not yet committed first, so a crash or Ctrl-C never loses the agent's work
         if self.keep_branch and self.worktree and self.worktree.exists():
             try:
                 commit_all(self.worktree, f"agent task {self.task_id}")
-                if git("rev-parse", self.branch, cwd=self.top).strip() == self.base:
-                    self.keep_branch = False   # branch has no work on it, don't leave an empty one
+                if not self._has_pending():
+                    self.keep_branch = False   # nothing on the branch that your folder doesn't have
             except Exception:
                 pass
         if self.container:
@@ -213,10 +262,38 @@ class Workspace:
             out += f"\n[{len(lines) - max_results} more matches not shown. Use a more specific pattern or path.]"
         return out
 
+    # ------------------------------------------------------------------
+    # project notes (memory across tasks): a normal file, so changes show up in the diff for review
+    # ------------------------------------------------------------------
+    def read_notes(self) -> str:
+        notes = self.workdir / NOTES_FILE
+        if not notes.exists():
+            return ""
+        text = notes.read_text().strip()
+        if len(text) > NOTES_MAX_CHARS:
+            text = text[:NOTES_MAX_CHARS] + "\n[notes cut: file is too long, shorten it]"
+        return text
+
+    def add_note(self, note: str) -> str:
+        note = " ".join(note.split())   # one line
+        if not note:
+            raise ValueError("The note is empty.")
+        if len(note) > NOTE_MAX_CHARS:
+            raise ValueError(f"The note is {len(note)} characters; keep it under {NOTE_MAX_CHARS}.")
+        path = self.workdir / NOTES_FILE
+        current = path.read_text() if path.exists() else "# Project notes\n"
+        if f"- {note}\n" in current + "\n":
+            return "Already noted."
+        if len(current) + len(note) > NOTES_MAX_CHARS:
+            raise ValueError(f"{NOTES_FILE} is full ({len(current)} characters). "
+                             "Shorten it with edit_file first, keeping only what matters.")
+        path.write_text(current.rstrip("\n") + f"\n- {note}\n")
+        return f"Saved to {NOTES_FILE}. It will be part of the diff you review."
+
     def diff_now(self) -> str:
-        """Everything changed so far (including new files), compared to where the task started."""
+        """Everything the agent changed that your folder doesn't have yet (including new files)."""
         git("add", "-A", cwd=self.worktree)
-        return git("diff", self.base, cwd=self.worktree) or "No changes yet."
+        return git("diff", self.mark, cwd=self.worktree) or "No changes yet."
 
     # ------------------------------------------------------------------
     # running commands
@@ -237,29 +314,100 @@ class Workspace:
     # ------------------------------------------------------------------
     # finishing: review, then accept, keep or discard
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # keeping your folder and the agent's copy in sync
+    # ------------------------------------------------------------------
+    def _snapshot(self, parent):
+        """A commit holding exactly what your folder looks like right now: committed files, uncommitted edits and
+        new files, minus what .gitignore hides. It is built with a temporary copy of the git index, so your own
+        index and files are never touched."""
+        with tempfile.TemporaryDirectory() as tmp:
+            index = Path(tmp) / "index"
+            real_index = self.top / git("rev-parse", "--git-path", "index", cwd=self.top).strip()
+            if real_index.exists():
+                shutil.copy(real_index, index)   # keeps the file stat info, so only changed files get re-read
+            env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+            git("add", "-A", cwd=self.top, env=env)
+            tree = git("write-tree", cwd=self.top, env=env).strip()
+        args = ["-c", "user.name=ce-agent", "-c", "user.email=ce-agent@localhost",
+                "commit-tree", tree, "-m", "snapshot of your folder"]
+        if parent:
+            args += ["-p", parent]
+        return git(*args, cwd=self.top).strip()
+
+    def _tree(self, commit) -> str:
+        return git("rev-parse", f"{commit}^{{tree}}", cwd=self.top).strip()
+
+    def _has_pending(self) -> bool:
+        """Does the agent's branch hold changes that your folder doesn't have? (When unsure: yes, to be safe.)"""
+        r = subprocess.run(["git", "diff", "--quiet", self.mark, self.branch], cwd=self.top, capture_output=True)
+        return r.returncode != 0
+
+    def sync(self) -> str:
+        """Before each prompt: if you changed your folder meanwhile (edited, committed, switched branch), bring
+        those changes into the agent's copy, keeping the agent's pending work. Returns a message, or ''."""
+        self.last_sync_changes = []
+        try:
+            snap = self._snapshot(self.mark)
+        except RuntimeError as e:
+            return f"[warning] could not look at your folder to sync: {e}"
+        if self._tree(snap) == self._tree(self.mark):
+            return ""   # your folder is as the agent's copy expects
+        r = subprocess.run(["git", "-c", "user.name=ce-agent", "-c", "user.email=ce-agent@localhost",
+                            "merge", "--no-edit", snap], cwd=self.worktree, capture_output=True, text=True)
+        if r.returncode != 0:
+            subprocess.run(["git", "merge", "--abort"], cwd=self.worktree, capture_output=True)
+            return ("[warning] your recent changes conflict with the agent's pending changes, so they were NOT "
+                    "brought into the agent's copy. The agent keeps working on the older snapshot.")
+        self.last_sync_changes = git("diff", "--name-status", self.mark, snap, cwd=self.top).strip().splitlines()
+        self.mark = snap
+        return "The agent's copy now includes your latest changes."
+
     def finish(self) -> str:
-        """Commit whatever the agent changed onto its branch and return the full diff against where it started."""
+        """Commit what the agent changed and return the pending diff: what the agent has that your folder doesn't."""
         commit_all(self.worktree, f"agent task {self.task_id}")
-        return git("diff", self.base, self.branch, cwd=self.top)
+        return git("diff", self.mark, self.branch, cwd=self.top)
+
+    def checkpoint(self, message: str) -> bool:
+        """Save the agent's work so far as a commit on its branch (also keeps it safe if we crash).
+        Returns True if the agent changed anything since the last checkpoint."""
+        return commit_all(self.worktree, message)
 
     def stat(self) -> str:
-        """Short summary of which files changed (call after finish())."""
-        return git("diff", "--stat", self.base, self.branch, cwd=self.top)
+        """Short summary of which files are pending (call after finish())."""
+        return git("diff", "--stat", self.mark, self.branch, cwd=self.top)
 
     def accept(self) -> str:
-        """Merge the agent's branch into whatever branch is checked out in your real repo."""
-        try:
-            git("merge", "--no-ff", "-m", f"Merge agent task {self.task_id}", self.branch, cwd=self.top)
-        except RuntimeError as e:
-            subprocess.run(["git", "merge", "--abort"], cwd=self.top, capture_output=True)
-            return f"Merge failed, nothing changed. Branch {self.branch} is kept so you can merge it by hand.\n{e}"
-        self.keep_branch = False   # the work is safely in your repo now
-        return "Merged into your repo."
+        """Apply the agent's pending changes to your folder as a patch. They arrive as ordinary uncommitted edits.
+        All or nothing: if the patch doesn't fit what is in your folder now, nothing is changed."""
+        patch = subprocess.run(["git", "diff", "--binary", self.mark, self.branch], cwd=self.top,
+                               capture_output=True).stdout
+        if not patch:
+            return "Nothing to apply."
+        check = subprocess.run(["git", "apply", "--check", "--whitespace=nowarn"], cwd=self.top,
+                               input=patch, capture_output=True)
+        if check.returncode != 0:
+            saved = self.top / ".agent" / "patches" / f"{self.task_id}.patch"
+            saved.parent.mkdir(parents=True, exist_ok=True)
+            saved.write_bytes(patch)
+            return ("Could not apply the changes: they don't fit what is in your folder now. Nothing was changed, "
+                    f"and the changes stay pending in the workspace.\n{check.stderr.decode().strip()}\n"
+                    f"The patch is saved at {saved}")
+        subprocess.run(["git", "apply", "--whitespace=nowarn"], cwd=self.top, input=patch, check=True, capture_output=True)
+        self.mark = git("rev-parse", self.branch, cwd=self.top).strip()   # your folder now matches the branch
+        return "Applied to your folder as uncommitted changes. Review them with git diff and commit when you like."
+
+    def reject_pending(self):
+        """Throw away everything the agent changed that is not in your folder yet: the agent's copy goes back to
+        exactly what your folder had."""
+        git("reset", "--hard", self.mark, cwd=self.worktree)
+        git("clean", "-fd", cwd=self.worktree)
 
     def keep(self) -> str:
         """Leave the work on its branch for later."""
         self.keep_branch = True
-        return f"Kept as branch {self.branch}. Review: git diff {self.base[:8]} {self.branch}"
+        return (f"Kept as branch {self.branch}.\n  See the changes:  git diff {self.mark[:10]} {self.branch}\n"
+                f"  Apply them:       git diff {self.mark[:10]} {self.branch} | git apply")
 
     def discard(self):
         """Throw the work away: cleanup() will delete the branch."""

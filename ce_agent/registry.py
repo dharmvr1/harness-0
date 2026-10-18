@@ -10,6 +10,7 @@ from typing import get_type_hints, Annotated, get_origin, get_args
 # Python type -> JSON Schema type
 JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean"}
 
+
 class Registry:
     def __init__(self):
         self.tools = {}
@@ -19,7 +20,25 @@ class Registry:
         self.tools[func.__name__] = {
             "func": func,
             "description": description,
-            "schema": self._generate_schema(func)
+            "schema": self._generate_schema(func),
+        }
+
+    def register_remote(self, tool, call):
+        """Register a tool that lives on an MCP server. `tool` is its MCP definition (name, description,
+        inputSchema); `call(name, arguments)` runs it and returns {"status": ..., "content" / "error": ...}.
+        After this the tool looks exactly like a local one to the rest of the harness."""
+        name = tool["name"]
+
+        def remote(**kwargs):
+            result = call(name, kwargs)
+            if result["status"] == "error":
+                raise RuntimeError(result["error"])      # Registry.call turns it into an error result, as for local tools
+            return result["content"]
+
+        self.tools[name] = {
+            "func": remote,
+            "description": tool.get("description", ""),
+            "schema": tool.get("inputSchema") or {"type": "object", "properties": {}},
         }
 
     def _generate_schema(self, func):
@@ -27,7 +46,8 @@ class Registry:
         hints = get_type_hints(func, include_extras=True)
         params = {}
         for name, hint in hints.items():
-            if name == "return": continue
+            if name == "return":
+                continue
 
             # Extract description from Annotated
             desc = "No description"
@@ -44,14 +64,22 @@ class Registry:
 
     def get_tool_list(self):
         """Return schema for all tools (for the LLM)."""
-        return {name: {"description": t["description"], "parameters": t["schema"]}
-                for name, t in self.tools.items()}
+        return {
+            name: {"description": t["description"], "parameters": t["schema"]}
+            for name, t in self.tools.items()
+        }
 
     def get_openai_tools(self):
         """Same schemas, in the format OpenAI-compatible APIs expect."""
         return [
-            {"type": "function",
-             "function": {"name": name, "description": t["description"], "parameters": t["schema"]}}
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": t["description"],
+                    "parameters": t["schema"],
+                },
+            }
             for name, t in self.tools.items()
         ]
 
@@ -61,14 +89,17 @@ class Registry:
             return {"status": "error", "error": f"Tool {name} not found"}
 
         # Models are sloppy: they send null for optional args and numbers as strings. Fix both.
-        props = self.tools[name]["schema"]["properties"]
+        props = self.tools[name]["schema"].get("properties", {})
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         for k, v in kwargs.items():
             if props.get(k, {}).get("type") == "integer" and isinstance(v, str):
                 try:
                     kwargs[k] = int(v)
                 except ValueError:
-                    return {"status": "error", "error": f"{k} must be a whole number, got '{v}'"}
+                    return {
+                        "status": "error",
+                        "error": f"{k} must be a whole number, got '{v}'",
+                    }
 
         try:
             result = self.tools[name]["func"](**kwargs)

@@ -2,14 +2,18 @@
 The tools the model can call. Each is a plain function with type hints;
 the Registry turns them into schemas for the LLM.
 The real work is done by the Workspace, so these stay thin.
+
+Two groups:
+  - workspace tools: need only the files on disk. These can be served over MCP (ce_agent/mcp/).
+  - local tools: depend on the harness's own state (the plan, the review baseline), so they always run in-process.
 """
 
 from typing import Annotated
 
 
-def make_tools(ws):
-    """Build the tools, bound to one workspace. Returns (function, description) pairs.
-    Errors are raised; the registry turns them into text for the model."""
+def make_workspace_tools(ws):
+    """Tools that only need the workspace's files. Returns (function, description) pairs.
+    Errors are raised; the registry (or the MCP server) turns them into text for the model."""
 
     def list_files():
         return ws.list_files()
@@ -51,8 +55,8 @@ def make_tools(ws):
         # Give the model everything: exit code and both output streams
         return f"exit code: {r['exit_code']}\n--- stdout ---\n{r['stdout']}\n--- stderr ---\n{r['stderr']}"
 
-    def git_diff():
-        return ws.diff_now()
+    def remember(note: Annotated[str, "One short fact about the project worth remembering in future tasks"]):
+        return ws.add_note(note)
 
     return [
         (list_files, "List all files in the project (skips ignored files)"),
@@ -74,7 +78,37 @@ def make_tools(ws):
             "Run a shell command (e.g. run the code or tests). No internet access",
         ),
         (
+            remember,
+            "Save one short, lasting fact about this project to AGENTS.md (shown to future tasks)",
+        ),
+    ]
+
+
+def make_local_tools(ws, set_plan=None):
+    """Tools that depend on the harness's own state, so they never go over MCP.
+    git_diff compares against the review baseline (ws.mark) that the harness moves at every sync and accept;
+    update_plan changes the session's plan."""
+
+    def git_diff():
+        return ws.diff_now()
+
+    def update_plan(steps: Annotated[str, "The whole plan, one step per line: '[ ] todo', '[~] in progress' or '[x] done', then the step text"]):
+        return set_plan(steps)
+
+    tools = [
+        (
             git_diff,
             "Show all changes you have made so far. Use it to review your work before finishing",
         ),
     ]
+    if set_plan:   # only sessions keep a plan
+        tools.append((
+            update_plan,
+            "Write or update your plan for a task with several steps or files. Send the WHOLE plan every time",
+        ))
+    return tools
+
+
+def make_tools(ws, set_plan=None):
+    """All tools, in-process. Same order as always: workspace tools, then git_diff, then update_plan."""
+    return make_workspace_tools(ws) + make_local_tools(ws, set_plan)

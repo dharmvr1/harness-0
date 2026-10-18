@@ -156,7 +156,7 @@ def test_model_sees_error_and_recovers(repo, monkeypatch):
         def think(self, messages, tools):
             seen.append(list(messages))
             assert {t["function"]["name"] for t in tools} == {
-                "list_files", "search", "read_file", "edit_file", "write_file", "run_shell", "git_diff"}
+                "list_files", "search", "read_file", "edit_file", "write_file", "run_shell", "remember", "git_diff", "update_plan"}
             return script.pop(0)
 
     monkeypatch.setattr("builtins.input", lambda _="": "a")

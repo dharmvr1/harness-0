@@ -4,3 +4,4 @@ METHODOLOGY.md
 .agent/
 __pycache__/
 *.egg-info/
+docs
