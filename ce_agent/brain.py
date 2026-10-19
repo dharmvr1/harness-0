@@ -6,8 +6,8 @@ Pick the provider with the PROVIDER env var (default: openrouter).
 
 import os
 from openai import OpenAI
-from dotenv import load_dotenv
-load_dotenv()
+from dotenv import find_dotenv, load_dotenv
+load_dotenv(find_dotenv(usecwd=True))   # a .env in the folder you run the command from
 
 PROVIDERS = {
     "groq": {

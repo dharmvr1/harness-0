@@ -160,7 +160,7 @@ def run_session(
         ws.cleanup()  # removes container + worktree; the branch stays if it holds unreviewed work
         if ws.keep_branch:
             print(f"\nYour work is saved on branch {ws.branch}")
-        print(f"Trajectory: python -m ce_agent.main {repo_path} --show {ws.task_id}")
+        print(f"Trajectory: ce-agent {repo_path} --show {ws.task_id}")
     print("\n--- Session finished ---")
 
 

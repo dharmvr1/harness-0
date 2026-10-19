@@ -44,7 +44,7 @@ now as uncommitted changes, reject = workspace reset (the model is told), later 
 ## Not done yet
 - Summarising old turns with the model (today we only clear old tool output), `--resume` of a saved session
 - MCP: `notifications/cancelled` over stdio (the stdio server handles one request at a time, so it cannot hear it while busy), multi round-trip requests, `subscriptions/listen`, keep-alive HTTP connections, a legacy (`initialize`) shim. The installed official SDK (1.28.1) speaks only up to 2025-11-25, so it cannot talk to our modern-only server until the shim exists. Cancelling a command inside a Docker container kills the `docker exec` client but not the process inside it (it ends at its own 60 s limit)
-- Hooks
+- Hook types other than PreToolUse (see Hooks below)
 - Rust / Node / Go presets (image, registries, resources) are written from what I know of those tools and are NOT tried end to end here (only Python/PyPI was). Not built: a setup phase or human approval before the network opens, a process tool for dev servers, per-tool network rules (e.g. git over SSH), bandwidth limits
 
 ## Run
@@ -70,3 +70,6 @@ First run with a real model (see docs/PROBLEMS.md #38): output cap (`MAX_TOKENS`
 
 ## Hooks
 `ce_agent/hooks.py`: PreToolUse allow/deny/ask from `<repo>/.agent/hooks.json` plus built-in guards (docs/PROBLEMS.md #39). Other hook types not done.
+
+## Limits and status line
+Session limits `SESSION_MAX_TURNS`, `MAX_COST_USD` (+ prices), one-line status after each step (docs/PROBLEMS.md #40). 759 tests pass.
