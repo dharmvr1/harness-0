@@ -45,8 +45,8 @@ def events(repo):
 
 
 def test_full_run_is_logged(repo, monkeypatch):
-    brain = FakeBrain(call("write_file", file_path="calc.py", content="print(2)\n"),
-                      call("run_shell", command="python3 calc.py"),
+    brain = FakeBrain(call("write_file", file_path="calc2.py", content="print(2)\n"),
+                      call("run_shell", command="python3 calc2.py"),
                       SimpleNamespace(content="finished", tool_calls=None))
     monkeypatch.setattr("builtins.input", lambda _="": "a")
     run_agent(str(repo), "make it two", unsafe=True, brain=brain)
@@ -58,11 +58,11 @@ def test_full_run_is_logged(repo, monkeypatch):
     assert start["task"] == "make it two" and start["model"] == "fake-model" and start["mode"] == "unsafe"
     assert ev[2]["usage"] == {"prompt_tokens": 100, "completion_tokens": 10}
     assert ev[2]["tool_calls"][0]["name"] == "write_file"
-    assert ev[3]["status"] == "ok" and ev[3]["args"]["file_path"] == "calc.py"
+    assert ev[3]["status"] == "ok" and ev[3]["args"]["file_path"] == "calc2.py"
     assert "2" in ev[5]["result"]                        # output of the python run
     assert end["reason"] == "done" and end["decision"] == "accept" and end["turns"] == 3
     assert end["total_prompt_tokens"] == 300 and end["total_completion_tokens"] == 30
-    assert "calc.py" in end["files_changed"]
+    assert "calc2.py" in end["files_changed"]
 
 
 def test_errors_are_logged_with_the_model_error_text(repo, monkeypatch):

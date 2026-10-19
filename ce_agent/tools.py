@@ -10,10 +10,16 @@ Two groups:
 
 from typing import Annotated
 
+from ce_agent.mcp.progress import report_progress
+
 
 def make_workspace_tools(ws):
     """Tools that only need the workspace's files. Returns (function, description) pairs.
     Errors are raised; the registry (or the MCP server) turns them into text for the model."""
+
+    # Files the model has read, edited or written in this session. write_file refuses to replace an existing file that
+    # is not in here: a real model overwrote a file it had never read and deleted two functions in it.
+    known = set()
 
     def list_files():
         return ws.list_files()
@@ -33,7 +39,9 @@ def make_workspace_tools(ws):
         start_line: Annotated[int, "First line to read (default 1)"] = 1,
         end_line: Annotated[int, "Last line to read (default: end of file)"] = None,
     ):
-        return ws.read_file(file_path, start_line, end_line)
+        text = ws.read_file(file_path, start_line, end_line)
+        known.add(ws._safe_path(file_path))
+        return text
 
     def edit_file(
         file_path: Annotated[str, "Path of the existing file to edit"],
@@ -42,16 +50,28 @@ def make_workspace_tools(ws):
         ],
         new_text: Annotated[str, "Text to put in its place"],
     ):
-        return ws.edit_file(file_path, old_text, new_text)
+        result = ws.edit_file(file_path, old_text, new_text)
+        known.add(ws._safe_path(file_path))
+        return result
 
     def write_file(
         file_path: Annotated[str, "Path of the file to create"],
         content: Annotated[str, "Full content of the file"],
     ):
-        return ws.write_file(file_path, content)
+        full = ws._safe_path(file_path)
+        if full.exists() and full not in known:
+            raise ValueError(
+                f"{file_path} already exists and you have not read it in this session, so writing it would throw "
+                "away its current content. Read it with read_file first, then change it with edit_file "
+                "(use write_file on it only if you really mean to replace all of it)."
+            )
+        result = ws.write_file(file_path, content)
+        known.add(full)
+        return result
 
     def run_shell(command: Annotated[str, "Shell command to run in the workspace"]):
-        r = ws.run(command)
+        # While the command runs, tell the client (if it asked) that we are alive; a cancelled request stops here.
+        r = ws.run(command, on_tick=lambda seconds: report_progress(seconds, message=f"command running for {seconds:.0f}s"))
         # Give the model everything: exit code and both output streams
         return f"exit code: {r['exit_code']}\n--- stdout ---\n{r['stdout']}\n--- stderr ---\n{r['stderr']}"
 
@@ -71,11 +91,11 @@ def make_workspace_tools(ws):
         ),
         (
             write_file,
-            "Create a NEW file, or completely rewrite a small one. Use edit_file to change existing files",
+            "Create a NEW file. An existing file must be read first; to change one, use edit_file (write_file replaces ALL of its content)",
         ),
         (
             run_shell,
-            "Run a shell command (e.g. run the code or tests). No internet access",
+            "Run a shell command (e.g. run the code or tests). The system prompt says what the sandbox allows",
         ),
         (
             remember,

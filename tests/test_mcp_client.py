@@ -213,6 +213,41 @@ def test_the_read_only_list_can_be_configured():
     transport = Crashy(failures=1)
     assert McpClient(transport, read_only=["my_tool"]).call_tool("my_tool", {})["status"] == "ok"
 
+class TimingOut(FakeTransport):
+    """Every request times out."""
+    def __init__(self, cancels_on_timeout):
+        super().__init__(lambda m: ok(m))
+        if cancels_on_timeout:
+            self.cancels_on_timeout = True
+
+    def request(self, message):
+        self.requests.append(message)
+        raise p.McpTimeout("no reply within 1s")
+
+def test_a_timeout_over_a_transport_that_cancels_on_close_does_not_restart_it():
+    transport = TimingOut(cancels_on_timeout=True)                   # like HTTP: giving up closes the connection
+    result = McpClient(transport).call_tool("run_shell", {"command": "x"})
+    assert transport.restarts == 0 and len(transport.requests) == 1
+    assert "timed out and was cancelled" in result["error"] and "may or may not have completed" in result["error"]
+
+def test_a_timeout_over_stdio_restarts_the_stuck_server():
+    transport = TimingOut(cancels_on_timeout=False)
+    result = McpClient(transport).call_tool("run_shell", {"command": "x"})
+    assert transport.restarts == 1 and "stopped and was restarted" in result["error"]
+
+def test_a_read_only_call_is_retried_after_a_cancelling_timeout_but_only_once():
+    transport = TimingOut(cancels_on_timeout=True)
+    McpClient(transport).call_tool("read_file", {"file_path": "a"})
+    assert transport.restarts == 0 and len(transport.requests) == 2
+
+def test_other_mcp_errors_are_reported_as_they_are_without_a_restart():
+    class Refusing(FakeTransport):
+        def request(self, message):
+            raise p.McpHttpError("HTTP 401 Unauthorized from the MCP server")
+    transport = Refusing(lambda m: None)
+    assert McpClient(transport).call_tool("echo") == {"status": "error", "error": "HTTP 401 Unauthorized from the MCP server"}
+    assert transport.restarts == 0
+
 def test_close_closes_the_transport():
     transport = FakeTransport(lambda m: ok(m))
     McpClient(transport).close()

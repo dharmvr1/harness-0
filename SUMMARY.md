@@ -21,7 +21,8 @@ In a session you get this choice after every request that changed files: accept 
 now as uncommitted changes, reject = workspace reset (the model is told), later = stays pending.
 
 ## Done
-- MCP, hand-written, no SDK (protocol revision 2026-07-28, `ce_agent/mcp/`): a server for the 7 workspace tools and a client, over stdio. `--mcp` runs the tools in a separate server process; `update_plan` and `git_diff` stay in-process. The server refuses the older `initialize` handshake and says which version it speaks
+- **Sandbox environment** (`environment.py`, `egress.py`, `egress_proxy.py`): the image, network mode, limits and caches follow the project. Detected from its files (Cargo.toml -> rust, package.json -> node, go.mod -> go, else python), overridden by `<repo>/.agent/env.json` (outside the agent's copy, so the model cannot edit its own policy) and by flags. Network `none` (default) / `registries` (only package hosts, through an allowlist proxy on an internal Docker network: no direct route, no outside DNS) / `full` (loud warning). Per-project cache folder at `/cache` survives sessions; the model is told what the sandbox allows; what the proxy allowed and refused is printed and logged. `--env` shows the settings
+- MCP, hand-written, no SDK (protocol revision 2026-07-28, `ce_agent/mcp/`): a server for the 7 workspace tools and a client, over stdio or Streamable HTTP. `--mcp[=stdio|http]` runs the tools in a separate server process; `update_plan` and `git_diff` stay in-process. HTTP: Origin/Host checks, bearer token (passed in the environment, never argv), header/body consistency checks incl. `x-mcp-header`, JSON or Server-Sent Events replies, progress for long commands, closing the connection cancels (and kills) the command. The server refuses the older `initialize` handshake and says which version it speaks. `python -m ce_agent.mcp.bench` compares in-process / stdio / HTTP
 - Works on a dirty folder: the agent's copy starts from a snapshot of your folder (committed + uncommitted + new files, minus .gitignore), built with a temporary index so your files/index/history are never touched
 - Per-prompt review: accept applies only the agent's changes to your folder as a patch (checked first, all or nothing); nothing is ever committed for you
 - Two-way sync: edits, commits or branch switches you make mid-session are merged into the agent's copy before the next prompt (3-way, aborts safely on conflict)
@@ -38,13 +39,13 @@ now as uncommitted changes, reject = workspace reset (the model is told), later 
 - Git worktree + Docker sandbox (no network, memory/process limits, non-root, caps dropped)
 - `--unsafe-local` mode (no container, clean environment so API keys are not exposed)
 - Work is never lost: crash or Ctrl-C saves it on the branch; `--cleanup` recovers after a hard kill
-- Tests: `tests/test_workspace.py`, `tests/test_loop.py` (loop with a fake brain, no API needed), `tests/test_tools.py`, `tests/test_trace.py`, `tests/test_notes.py`, `tests/test_fresh_repo.py`, `tests/test_snapshot.py`, `tests/test_context.py`, `tests/test_session.py`, `tests/test_mcp_protocol.py`, `tests/test_mcp_server.py`, `tests/test_mcp_stdio.py`, `tests/test_mcp_client.py`, `tests/test_mcp_integration.py` (241 tests in total)
+- Tests: `tests/test_workspace.py`, `tests/test_loop.py` (loop with a fake brain, no API needed), `tests/test_tools.py`, `tests/test_trace.py`, `tests/test_notes.py`, `tests/test_fresh_repo.py`, `tests/test_snapshot.py`, `tests/test_context.py`, `tests/test_session.py`, `tests/test_mcp_protocol.py`, `tests/test_mcp_server.py`, `tests/test_mcp_stdio.py`, `tests/test_mcp_client.py`, `tests/test_mcp_integration.py`, `tests/test_mcp_headers.py`, `tests/test_mcp_sse.py`, `tests/test_mcp_http.py`, `tests/test_mcp_http_process.py`, `tests/test_run_progress.py`, `tests/test_mcp_bench.py`, `tests/test_environment.py`, `tests/test_egress_proxy.py`, `tests/test_sandbox_network.py`, `tests/test_environment_wiring.py` (647 tests in total; `test_sandbox_network.py` uses real containers and is skipped without Docker)
 
 ## Not done yet
 - Summarising old turns with the model (today we only clear old tool output), `--resume` of a saved session
-- MCP: Streamable HTTP transport, progress/cancellation, a legacy (`initialize`) shim. The installed official SDK (1.28.1) speaks only up to 2025-11-25, so it cannot talk to our modern-only server until the shim exists
+- MCP: `notifications/cancelled` over stdio (the stdio server handles one request at a time, so it cannot hear it while busy), multi round-trip requests, `subscriptions/listen`, keep-alive HTTP connections, a legacy (`initialize`) shim. The installed official SDK (1.28.1) speaks only up to 2025-11-25, so it cannot talk to our modern-only server until the shim exists. Cancelling a command inside a Docker container kills the `docker exec` client but not the process inside it (it ends at its own 60 s limit)
 - Hooks
-- Per-project Docker images (the default image has no pytest/git, and the network is off)
+- Rust / Node / Go presets (image, registries, resources) are written from what I know of those tools and are NOT tried end to end here (only Python/PyPI was). Not built: a setup phase or human approval before the network opens, a process tool for dev servers, per-tool network rules (e.g. git over SSH), bandwidth limits
 
 ## Run
 ```
@@ -52,9 +53,20 @@ export OPENROUTER_API_KEY=...        # or PROVIDER=groq GROQ_API_KEY=...  (or us
 python -m ce_agent.main ~/myproject                      # interactive session
 python -m ce_agent.main ~/myproject "fix the bug"        # first request, then keep going
 python -m ce_agent.main ~/myproject "fix the bug" --once # one request, then review
-python -m ce_agent.main ~/myproject --mcp                # workspace tools served by a separate MCP server process
+python -m ce_agent.main ~/myproject --mcp                # workspace tools served by a separate MCP server process (stdio)
+python -m ce_agent.main ~/myproject --mcp=http           # ...over Streamable HTTP on a random localhost port
+python -m ce_agent.mcp.bench                             # in-process vs stdio vs HTTP: cold start and per-call latency
+python -m ce_agent.main ~/myproject --env                # show the sandbox settings that would be used
+python -m ce_agent.main ~/myproject --network=registries # packages may be installed from the project's registries only
+python -m ce_agent.main ~/myproject --image=rust:1-slim --memory=4g --timeout=900 --network=registries   # (flags use = , no space)
 # env: CONTEXT_TOKENS (default 32000), SESSION_TOKEN_BUDGET (default 500000)
 python -m ce_agent.main sandbox_testing --show      # what did the last run do?
 python -m pytest tests
 ```
 Uncommitted changes are fine (the agent sees them). A new or non-git folder is fine too: it offers to run `git init`.
+
+## Real-model run
+First run with a real model (see docs/PROBLEMS.md #38): output cap (`MAX_TOKENS`), backend pinning (`PROVIDER_ORDER`), retry on cut-off tool calls, nudge after a failed call, read-before-overwrite, one tool call per reply. 691 tests pass. A weak model still sometimes claims work it did not do; verification belongs to hooks/evals.
+
+## Hooks
+`ce_agent/hooks.py`: PreToolUse allow/deny/ask from `<repo>/.agent/hooks.json` plus built-in guards (docs/PROBLEMS.md #39). Other hook types not done.

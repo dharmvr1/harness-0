@@ -13,7 +13,9 @@ from pathlib import Path
 
 import ce_agent
 from ce_agent.mcp import protocol as p
+from ce_agent.mcp.headers import mirrored_parameters
 from ce_agent.mcp.stdio import StdioClient, server_env
+from ce_agent.mcp.streamable_http import HttpServerProcess
 
 PROJECT_ROOT = Path(ce_agent.__file__).parent.parent
 CLIENT_INFO = {"name": "ce-agent", "version": "0.1.0"}
@@ -35,14 +37,24 @@ class McpClient:
         self.server_versions = []
         self._next_id = 0
         self._tools = None                      # (list of tools, time until which it is fresh)
+        self.on_progress = None                 # optional: called with the params of every notifications/progress
+        self.rejected_tools = []                # (name, reason) for tools we refused to offer (bad x-mcp-header)
+        self._schemas = {}                      # tool name -> inputSchema, for the transport's Mcp-Param-* headers
+        transport.on_notification = self._on_notification
+        transport.schema_lookup = self._schemas.get
 
     # ------------------------------------------------------------------
     # one request
     # ------------------------------------------------------------------
     def _send(self, method, params):
         self._next_id += 1
-        message = p.make_request(self._next_id, method, params, version=self.version, client_info=self.client_info)
+        message = p.make_request(self._next_id, method, params, version=self.version, client_info=self.client_info,
+                                 progress_token=self._next_id if self.on_progress else None)   # ids are unique, so tokens are too
         return self.transport.request(message)
+
+    def _on_notification(self, notification):
+        if notification.get("method") == "notifications/progress" and self.on_progress:
+            self.on_progress(notification.get("params", {}))
 
     def _once(self, method, params):
         reply = self._send(method, params)
@@ -100,6 +112,20 @@ class McpClient:
             cursor = result.get("nextCursor")
             if not cursor:
                 break
+        if getattr(self.transport, "mirrors_headers", False):
+            # Over HTTP, parameters marked x-mcp-header are copied into headers. A tool whose markings break the
+            # rules is dropped (the spec: MUST), so one bad definition cannot spoil the others.
+            valid = []
+            for tool in tools:
+                try:
+                    mirrored_parameters(tool.get("inputSchema") or {})
+                except ValueError as e:
+                    self.rejected_tools.append((tool["name"], str(e)))
+                    continue
+                valid.append(tool)
+            tools = valid
+        self._schemas.clear()
+        self._schemas.update({t["name"]: t.get("inputSchema") for t in tools})
         self._tools = (tools, self.clock() + max(ttl_ms or 0, 0) / 1000)
         return list(tools)
 
@@ -114,17 +140,26 @@ class McpClient:
         try:
             try:
                 result = self._rpc("tools/call", params)
-            except p.McpConnectionError:
-                self.transport.restart()
+            except p.McpConnectionError as e:
+                # Over HTTP, giving up on a request means closing its connection, and that CANCELS the request on the
+                # server (the spec says so). The server is fine, so there is nothing to restart. Anything else
+                # (a dead process, a broken pipe, a stuck stdio server) needs a fresh server.
+                cancelled = isinstance(e, p.McpTimeout) and getattr(self.transport, "cancels_on_timeout", False)
+                if not cancelled:
+                    self.transport.restart()
                 if name not in self.read_only:
                     raise
                 result = self._rpc("tools/call", params)        # reading again is harmless
         except p.McpRpcError as e:
             return {"status": "error", "error": str(e)}
         except p.McpConnectionError as e:
+            what = ("timed out and was cancelled" if isinstance(e, p.McpTimeout) and getattr(self.transport, "cancels_on_timeout", False)
+                    else "stopped and was restarted")
             return {"status": "error", "error": (
-                f"The tool server stopped while running '{name}' and was restarted: {e}. "
-                "The call may or may not have completed: check the current state before repeating it.")}
+                f"The tool call '{name}' {what}: {e}. "
+                "It may or may not have completed: check the current state before repeating it.")}
+        except p.McpError as e:                  # refused before any tool ran (HTTP 401/413/..., no shared version...)
+            return {"status": "error", "error": str(e)}
         return self._tool_result(result)
 
     @staticmethod
@@ -148,16 +183,24 @@ class McpClient:
 # ----------------------------------------------------------------------
 def server_command(ws):
     """The command that starts the tool server for this workspace (the harness owns the worktree and container)."""
-    command = [sys.executable, "-m", "ce_agent.mcp", "--worktree", str(ws.worktree), "--prefix", ws.prefix]
+    command = [sys.executable, "-m", "ce_agent.mcp", "--worktree", str(ws.worktree), "--prefix", ws.prefix,
+               "--command-timeout", str(ws.command_timeout)]
     if ws.container:
         command += ["--container", ws.container]
     return command
 
 
-def launch_workspace_server(ws, on_wire=None, timeout=120):
-    """Start the stdio tool server for `ws`, say hello with server/discover, and return a ready McpClient.
-    The timeout must exceed the 60 s limit that run_shell itself enforces."""
-    transport = StdioClient(server_command(ws), env=server_env(), cwd=PROJECT_ROOT, timeout=timeout, on_wire=on_wire)
+def launch_workspace_server(ws, on_wire=None, timeout=None, transport="stdio"):
+    """Start the tool server for `ws` ("stdio" or "http"), say hello with server/discover, and return a ready
+    McpClient. The client's timeout must exceed the time limit that run_shell itself enforces, so it defaults to
+    that limit plus a minute."""
+    timeout = timeout or ws.command_timeout + 60
+    if transport == "http":
+        transport = HttpServerProcess(server_command(ws), env=server_env(), cwd=PROJECT_ROOT, timeout=timeout, on_wire=on_wire)
+    elif transport == "stdio":
+        transport = StdioClient(server_command(ws), env=server_env(), cwd=PROJECT_ROOT, timeout=timeout, on_wire=on_wire)
+    else:
+        raise ValueError(f"unknown MCP transport {transport!r} (use 'stdio' or 'http')")
     client = McpClient(transport)
     try:
         transport.start()

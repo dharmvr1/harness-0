@@ -76,6 +76,8 @@ def show(path):
         if kind == "run_start":
             out.append(f"run {e['task_id']}  {e['time']}  model={e['model']}  mode={e['mode']}")
             out.append(f"task: {e['task']}")
+            if e.get("environment_text"):
+                out.append(e["environment_text"])
             if e.get("notes_chars"):
                 out.append(f"(loaded {e['notes_chars']} characters of project notes)")
         elif kind == "user_message":
@@ -91,6 +93,13 @@ def show(path):
             out.append(f"    (synced with your repo: {e['message']})")
             for change in e.get("changes", []):
                 out.append(f"        {change.replace(chr(9), ' ')}")
+        elif kind == "egress":
+            allowed = ", ".join(f"{host} x{n}" for host, n in e.get("allowed", {}).items()) or "nothing"
+            out.append(f"\nnetwork: allowed {allowed}")
+            for note in e.get("blocked", []):
+                out.append(f"network: BLOCKED {note}")
+        elif kind == "nudge":
+            out.append("    (the model stopped after a failed tool call; it was asked to try again)")
         elif kind == "mcp_connected":
             out.append(f"    (tools are served over MCP by {e['server']}, protocol {e['version']})")
         elif kind == "notes_changed":
@@ -100,7 +109,8 @@ def show(path):
         elif kind == "model_call":
             u = e.get("usage") or {}
             tokens = f"{u.get('prompt_tokens', '?')} in / {u.get('completion_tokens', '?')} out"
-            out.append(f"\n[turn {e['turn']}] model {e['seconds']}s, tokens {tokens}")
+            finish = f", finish: {e['finish_reason']}" if e.get("finish_reason") else ""
+            out.append(f"\n[turn {e['turn']}] model {e['seconds']}s, tokens {tokens}{finish}")
             if e.get("content"):
                 out.append(f"    says: {one_line(e['content'])}")
         elif kind == "tool_call":

@@ -59,11 +59,14 @@ def decode(line: str):
 # ----------------------------------------------------------------------
 # building messages
 # ----------------------------------------------------------------------
-def make_request(request_id, method, params=None, *, version=PROTOCOL_VERSION, client_info=None, capabilities=None):
-    """A request with the required _meta fields filled in."""
+def make_request(request_id, method, params=None, *, version=PROTOCOL_VERSION, client_info=None, capabilities=None,
+                 progress_token=None):
+    """A request with the required _meta fields filled in. A progress_token asks the server for progress updates."""
     meta = {META_VERSION: version, META_CLIENT_CAPS: capabilities if capabilities is not None else {}}
     if client_info:
         meta[META_CLIENT_INFO] = client_info
+    if progress_token is not None:
+        meta["progressToken"] = progress_token
     return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": {**(params or {}), "_meta": meta}}
 
 
@@ -170,3 +173,8 @@ class McpTimeout(McpConnectionError):
 
 class McpVersionError(McpError):
     """Client and server share no protocol version."""
+
+
+class McpHttpError(McpError):
+    """The HTTP layer refused the request (wrong token, bad headers, too large...) before MCP was involved.
+    Restarting the server would not help, so this is not a connection error."""

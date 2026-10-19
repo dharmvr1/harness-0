@@ -12,6 +12,7 @@ Three methods are implemented: server/discover, tools/list, tools/call.
 import time
 
 from ce_agent.mcp import protocol as p
+from ce_agent.mcp.progress import RequestCancelled, RequestContext, request_scope
 
 SERVER_INFO = {"name": "ce-agent-tools", "version": "0.1.0"}
 
@@ -53,6 +54,7 @@ class McpServer:
         self.instructions = instructions
         self.ttl_ms = ttl_ms                           # how long a client may cache discover / tools/list results
         self.log = log or (lambda message: None)
+        self.on_shutdown = lambda: None                # the entry point sets this to stop whatever the tools started
         self.methods = {
             "server/discover": self._discover,
             "tools/list": self._list_tools,
@@ -62,17 +64,21 @@ class McpServer:
     # ------------------------------------------------------------------
     # entry points
     # ------------------------------------------------------------------
-    def handle_line(self, line):
+    def handle_line(self, line, notify=None):
         """One line of text in, one line of text out (or None). This is what the stdio transport calls."""
         try:
             message = p.decode(line)
         except p.ProtocolError as e:
             return p.encode(e.to_response())
-        response = self.handle(message)
+        response = self.handle(message, notify=notify)
         return None if response is None else p.encode(response)
 
-    def handle(self, message):
-        """One incoming message (a dict) -> the response to send back, or None when no reply is due."""
+    def handle(self, message, notify=None, is_cancelled=None):
+        """One incoming message (a dict) -> the response to send back, or None when no reply is due.
+
+        `notify(message)` lets a running tool send notifications (progress) to the client while the request is
+        still being worked on. `is_cancelled()` says whether the client has gone away; when it has, the request is
+        abandoned and None is returned, because a cancelled request must get no further messages."""
         try:
             kind, request_id, method, params = p.check_request(message)
         except p.ProtocolError as e:
@@ -87,17 +93,29 @@ class McpServer:
                                       f"This server speaks MCP {', '.join(p.SUPPORTED_VERSIONS)} only; "
                                       "'initialize' belongs to older protocol versions",
                                       data={"supported": p.SUPPORTED_VERSIONS})
-            p.check_meta(params)
+            meta = p.check_meta(params)
             handler = self.methods.get(method)
             if handler is None:
                 raise p.ProtocolError(p.METHOD_NOT_FOUND, f"Method not found: {method}")
-            return p.result_response(request_id, handler(params), self.server_info)
+            token = meta.get("progressToken")
+            if isinstance(token, bool) or not isinstance(token, (str, int)):
+                token = None                                   # progress tokens are strings or integers
+            with request_scope(RequestContext(token, notify, is_cancelled)):
+                return p.result_response(request_id, handler(params), self.server_info)
+        except RequestCancelled:
+            self.log(f"{method} (id {request_id}) cancelled by the client")
+            return None
         except p.ProtocolError as e:
             e.request_id = request_id
             return e.to_response()
         except Exception as e:     # a bug in the server must never kill the server
             self.log(f"internal error handling {method}: {type(e).__name__}: {e}")
             return p.error_response(request_id, p.INTERNAL_ERROR, f"Internal error: {type(e).__name__}")
+
+    def input_schema(self, tool_name):
+        """The inputSchema of a tool, or None if there is no such tool (the HTTP transport needs it to check headers)."""
+        tool = self.registry.tools.get(tool_name)
+        return tool["schema"] if tool else None
 
     # ------------------------------------------------------------------
     # the three methods
@@ -140,6 +158,8 @@ class McpServer:
         try:
             text = str(tool["func"](**arguments))
             failed = False
+        except RequestCancelled:
+            raise                  # not a tool error: the client left, so there is nobody to tell
         except Exception as e:
             text, failed = str(e) or type(e).__name__, True
         self.log(f"tools/call {name}: {'error' if failed else 'ok'} in {time.monotonic() - started:.2f}s")

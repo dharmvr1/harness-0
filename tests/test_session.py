@@ -270,14 +270,15 @@ def test_later_keeps_changes_pending_and_they_pile_up(repo, monkeypatch):
 
 
 def test_reject_resets_the_workspace_and_tells_the_model(repo, monkeypatch):
-    brain = FakeBrain(call("write_file", file_path="calc.py", content="BROKEN\n"), say("changed calc"),
+    brain = FakeBrain(call("read_file", file_path="calc.py"), call("write_file", file_path="calc.py", content="BROKEN\n"),
+                      say("changed calc"),
                       call("read_file", file_path="calc.py"), say("it is back"))
     typed(monkeypatch, "break calc", "r", "read calc again", EOFError())
     run_session(str(repo), unsafe=True, brain=brain)
     assert (repo / "calc.py").read_text().startswith("def add")        # your folder never changed
-    tool_result = [m for m in brain.seen[3] if m["role"] == "tool"][-1]["content"]
+    tool_result = [m for m in brain.seen[4] if m["role"] == "tool"][-1]["content"]
     assert "def add" in tool_result and "BROKEN" not in tool_result    # the workspace was reset
-    assert "rejected your pending changes" in json.dumps(brain.seen[2])  # the model was told
+    assert "rejected your pending changes" in json.dumps(brain.seen[3])  # the model was told
 
 
 def test_commits_you_make_in_your_folder_reach_the_workspace(repo, monkeypatch):
@@ -318,7 +319,8 @@ def test_edits_you_make_mid_session_are_announced_when_picked_up(repo, monkeypat
 
 
 def test_conflicting_changes_are_warned_about_and_the_session_continues(repo, monkeypatch, capsys):
-    brain = FakeBrain(call("write_file", file_path="calc.py", content="agent version\n"), say("ok"), say("still here"))
+    brain = FakeBrain(call("read_file", file_path="calc.py"), call("write_file", file_path="calc.py", content="agent version\n"),
+                      say("ok"), say("still here"))
     def user_commits_conflict():
         (repo / "calc.py").write_text("human version\n")
         sh("git", "-c", "user.name=me", "-c", "user.email=me@x", "commit", "-qam", "human edit", cwd=repo)
@@ -374,10 +376,12 @@ def test_no_note_about_the_agents_own_accepted_changes(repo, monkeypatch):
 
 
 def test_model_is_not_told_when_the_sync_failed(repo, monkeypatch):
-    brain = FakeBrain(call("write_file", file_path="calc.py", content="agent version\n"), say("ok"), say("still here"))
+    brain = FakeBrain(call("read_file", file_path="calc.py"), call("write_file", file_path="calc.py", content="agent version\n"),
+                      say("ok"), say("still here"))
     def user_makes_conflicting_edit():
         (repo / "calc.py").write_text("human version\n")
         return "next request"
     typed(monkeypatch, "edit calc", "l", user_makes_conflicting_edit, EOFError(), "k")
     run_session(str(repo), unsafe=True, brain=brain)
-    assert "changed the project" not in json.dumps(brain.seen[2])               # its copy did not change, so no note
+    assert "agent/" in sh("git", "branch", cwd=repo)                              # the agent really had pending work
+    assert "changed the project" not in json.dumps(brain.seen[3])               # its copy did not change, so no note

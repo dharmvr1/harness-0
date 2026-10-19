@@ -15,12 +15,17 @@ All git commands run on the host, never inside the container.
 
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
-DEFAULT_IMAGE = "python:3.11-slim"
+from ce_agent.egress import EgressProxy
+from ce_agent.environment import DEFAULT_IMAGE, Environment, cache_dir_for  # noqa: F401  (DEFAULT_IMAGE stays importable from here)
+
+RUN_TICK_SECONDS = 1.0   # how often run() calls its on_tick callback while a command is still running
 NOTES_FILE = "AGENTS.md"
 NOTES_MAX_CHARS = 2000   # the notes are pasted into every prompt, so they must stay short
 NOTE_MAX_CHARS = 300
@@ -66,11 +71,19 @@ def ensure_repo(repo_path: str, ask=None):
 
 
 class Workspace:
-    def __init__(self, repo_path: str, unsafe: bool = False, network: bool = False, image: str = DEFAULT_IMAGE):
+    def __init__(self, repo_path: str, unsafe: bool = False, network=False, image: str = DEFAULT_IMAGE, environment=None):
+        """`environment` (see environment.py) says which image, network mode and limits the container gets.
+        The older `network` / `image` arguments still work when no environment is given:
+        network may be True (full), False (none) or the name of a mode."""
         self.repo_path = Path(repo_path).resolve()
         self.unsafe = unsafe      # True = run commands on the host, no Docker
-        self.network = network    # False = container has no internet
-        self.image = image
+        if environment is None:
+            mode = network if isinstance(network, str) else ("full" if network else "none")
+            environment = Environment(image=image, network=mode)
+        self.environment = environment
+        self.image = environment.image
+        self.command_timeout = environment.command_timeout    # seconds one run_shell command may take
+        self._egress = None       # the proxy (network mode "registries"), set in _start_container()
 
         self.task_id = uuid.uuid4().hex[:8]
         self.branch = f"agent/{self.task_id}"
@@ -82,16 +95,19 @@ class Workspace:
         self.last_sync_changes = []   # files the latest sync() brought in, as "M\tpath" / "A\tpath" / "D\tpath"
         self.prefix = ""              # the sub-folder we were pointed at, e.g. "sandbox_testing/"
         self.attached = False         # True: a view of someone else's worktree (see attach())
+        self._running = set()         # commands started by run() that have not finished yet
 
     # ------------------------------------------------------------------
     # start / cleanup
     # ------------------------------------------------------------------
     @classmethod
-    def attach(cls, worktree, prefix="", container=None):
+    def attach(cls, worktree, prefix="", container=None, command_timeout=None):
         """A Workspace over an EXISTING worktree (and container), for the MCP server process.
         Only the file and command operations work: the harness owns the lifecycle (start, sync, review,
         accept, cleanup), so start() and cleanup() are refused here. Without a container, commands run on the host."""
         ws = cls(str(worktree), unsafe=container is None)
+        if command_timeout:
+            ws.command_timeout = command_timeout
         ws.worktree = Path(worktree).resolve()
         ws.prefix = prefix
         ws.workdir = ws.worktree / prefix
@@ -145,6 +161,7 @@ class Workspace:
             return False
 
     def _start_container(self, prefix):
+        env = self.environment
         self.container = f"ce_agent_{self.task_id}"
         cmd = [
             "docker", "run", "-d", "--name", self.container,
@@ -152,17 +169,38 @@ class Workspace:
             "--init",                                      # reaps zombie processes
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--user", f"{os.getuid()}:{os.getgid()}",      # files we create belong to you, not root
-            "--memory", "512m", "--pids-limit", "100",
+            "--memory", env.memory, "--pids-limit", str(env.pids_limit),
             "-e", "HOME=/tmp", "-e", "PYTHONDONTWRITEBYTECODE=1",
             "-v", f"{self.worktree}:/repo",
             "-w", f"/repo/{prefix}",
         ]
-        if not self.network:
+        for name, value in env.container_env().items():
+            cmd += ["-e", f"{name}={value}"]
+        if env.cache:                                      # package and build caches that survive between sessions
+            cache = cache_dir_for(self.top)
+            cache.mkdir(parents=True, exist_ok=True)       # created by us, so it belongs to you, not to root
+            cmd += ["-v", f"{cache}:/cache"]
+
+        if env.network == "none":
             cmd += ["--network", "none"]
+        elif env.network == "registries":
+            self._egress = EgressProxy(self.task_id, self.top, env.hosts(), env.allow_private, env.egress_network)
+            self._egress.start()
+            cmd += ["--network", self._egress.network]
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+                cmd += ["-e", f"{name}={self._egress.url}"]
+            for name in ("NO_PROXY", "no_proxy"):
+                cmd += ["-e", f"{name}=localhost,127.0.0.1,::1"]
+        # "full": no network option at all, the container gets Docker's normal bridge network
+
         cmd += [self.image, "tail", "-f", "/dev/null"]    # keeps the container idle and alive
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError("Could not start container: " + r.stderr.strip())
+
+    def egress_entries(self):
+        """What the proxy has allowed and refused so far (network mode "registries"); [] otherwise."""
+        return self._egress.logs() if self._egress else []
 
     def cleanup(self):
         """Remove container and worktree. The branch stays if it holds work. Safe to call twice."""
@@ -179,6 +217,9 @@ class Workspace:
         if self.container:
             subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
             self.container = None
+        if self._egress:                                   # after the sandbox, so nothing still uses the network
+            self._egress.stop()
+            self._egress = None
         if self.worktree and self.worktree.exists():
             subprocess.run(["git", "worktree", "remove", "--force", str(self.worktree)],
                            cwd=self.top, capture_output=True)
@@ -221,7 +262,7 @@ class Workspace:
         text = raw.decode()
 
         if old_text == "":
-            raise ValueError("old_text is empty. Give the exact text you want to replace.")
+            raise ValueError("old_text is empty. Give the exact text you want to replace. To add code at the end of a file, use its last lines as old_text and put those same lines plus your new code in new_text.")
         count = text.count(old_text)
         if count == 0:
             raise ValueError(f"old_text was not found in {file_path}. Use read_file to see the current content; "
@@ -298,8 +339,13 @@ class Workspace:
     # ------------------------------------------------------------------
     # running commands
     # ------------------------------------------------------------------
-    def run(self, command: str, timeout: int = 60) -> dict:
-        """Run a shell command. Always returns exit_code, stdout and stderr."""
+    def run(self, command: str, timeout: int = None, on_tick=None) -> dict:
+        """Run a shell command. Always returns exit_code, stdout and stderr.
+
+        on_tick(seconds_so_far), if given, is called about once a second while the command is still running. It is
+        how a long command reports progress, and if it raises (the client cancelled), the command is killed.
+        The time limit defaults to the environment's command_timeout."""
+        timeout = timeout or self.command_timeout
         if self.unsafe:
             args = ["timeout", str(timeout), "sh", "-c", command]
             # Clean environment: the child must not see our API keys (they would end up in the model's prompt)
@@ -308,8 +354,41 @@ class Workspace:
         else:
             args = ["docker", "exec", self.container, "timeout", str(timeout), "sh", "-c", command]
             kwargs = {}
-        r = subprocess.run(args, capture_output=True, text=True, **kwargs)
-        return {"exit_code": r.returncode, "stdout": r.stdout, "stderr": r.stderr}  # 124 = timed out
+        # start_new_session makes the command a process group of its own, so a cancelled command can be killed
+        # together with everything it started (killing only the first process would leave the rest running).
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True, **kwargs)
+        started = time.monotonic()
+        self._running.add(process)
+        try:
+            while True:
+                try:
+                    # Calling communicate() again after a timeout loses no output (documented behaviour).
+                    stdout, stderr = process.communicate(timeout=RUN_TICK_SECONDS if on_tick else None)
+                    break
+                except subprocess.TimeoutExpired:
+                    on_tick(time.monotonic() - started)
+        except BaseException:
+            self._kill(process)          # includes the case where on_tick raised because the client cancelled
+            process.communicate()
+            raise
+        finally:
+            self._running.discard(process)
+        return {"exit_code": process.returncode, "stdout": stdout, "stderr": stderr}  # 124 = timed out
+
+    @staticmethod
+    def _kill(process):
+        """Kill a command together with everything it started (it leads its own process group)."""
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, AttributeError):
+            process.kill()
+
+    def kill_running(self):
+        """Stop every command that run() started and that is still going. Called when the tool server shuts down,
+        so that commands do not outlive the process that was running them."""
+        for process in list(self._running):
+            self._kill(process)
 
     # ------------------------------------------------------------------
     # finishing: review, then accept, keep or discard
@@ -426,6 +505,11 @@ def recover(repo_path: str) -> str:
     if ids:
         subprocess.run(["docker", "rm", "-f", *ids], capture_output=True)
         lines.append(f"Removed {len(ids)} leftover container(s).")
+    networks = subprocess.run(["docker", "network", "ls", "-q", "--filter", f"label=ce_agent_repo={top}"],
+                              capture_output=True, text=True).stdout.split()
+    if networks:                                           # containers first: a network in use cannot be removed
+        subprocess.run(["docker", "network", "rm", *networks], capture_output=True)
+        lines.append(f"Removed {len(networks)} leftover sandbox network(s).")
 
     for wt in sorted((top / ".agent" / "worktrees").glob("*")):
         commit_all(wt, f"agent task {wt.name} (recovered)")

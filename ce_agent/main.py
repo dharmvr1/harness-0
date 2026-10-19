@@ -7,10 +7,16 @@ The conversation (session.py) and the sandbox (workspace.py) stay alive across y
 Ctrl-D at the prompt ends the session and lets you review everything the agent changed.
 """
 
+import dataclasses
+import subprocess
 import sys
+import time
 
+from ce_agent.egress import summarize
+from ce_agent.environment import flags_to_overrides, resolve_environment
 from ce_agent.workspace import Workspace, ensure_repo, recover
 from ce_agent.brain import Brain
+from ce_agent.hooks import Hooks
 from ce_agent.session import Session
 from ce_agent.trace import Trace, clip_strings, show, find_run
 from ce_agent.mcp.client import launch_workspace_server
@@ -26,6 +32,8 @@ def run_session(
     brain=None,
     interactive=True,
     mcp=None,
+    environment=None,
+    env_overrides=None,
 ):
     brain = (
         brain or Brain()
@@ -35,7 +43,23 @@ def run_session(
             "!!! UNSAFE MODE: commands run directly on your machine, with no container. !!!"
         )
     ensure_repo(repo_path)  # fresh folder? offer to set it up (asks first)
-    ws = Workspace(repo_path, unsafe=unsafe, network=network)
+
+    # Which image, how much network, which limits: detected from the project, then .agent/env.json, then flags.
+    overrides = dict(env_overrides or {})
+    if network and "network" not in overrides:  # the older boolean argument
+        overrides["network"] = "full"
+    environment = environment or resolve_environment(
+        repo_path, overrides, top=repo_top(repo_path)
+    )
+    print(environment.describe(unsafe=unsafe))
+    if environment.network == "full" and not unsafe:
+        print(
+            "!!! FULL NETWORK: anything running in the sandbox can reach the whole internet, "
+            "including sending your project files out. Prefer --network=registries. !!!"
+        )
+
+    hooks = Hooks.load(repo_top(repo_path))   # a broken hooks.json should stop us before anything is created
+    ws = Workspace(repo_path, unsafe=unsafe, environment=environment)
     ws.start()  # cleans up after itself if it fails
     trace = Trace(ws.top / ".agent" / "runs" / f"{ws.task_id}.jsonl")
 
@@ -45,21 +69,38 @@ def run_session(
         notes = (
             ws.read_notes()
         )  # memory from earlier sessions: AGENTS.md in the project
-        if mcp == "stdio":
+        if mcp in ("stdio", "http"):
             # The workspace tools run in a separate MCP server process; every message is logged in the trace.
             mcp_client = launch_workspace_server(
                 ws,
+                transport=mcp,
                 on_wire=lambda direction, message: trace.log(
                     "mcp_wire", direction=direction, message=clip_strings(message)
                 ),
             )
+            last_shown = [0.0]
+
+            def show_progress(params):  # the server reports every second; showing every 5th is plenty
+                if time.monotonic() - last_shown[0] >= 5:
+                    last_shown[0] = time.monotonic()
+                    print(f"  [progress] {params.get('message') or params.get('progress')}")
+
+            mcp_client.on_progress = show_progress
             info = mcp_client.server_info or {}
             trace.log(
                 "mcp_connected",
                 server=f"{info.get('name', '?')} {info.get('version', '')}".strip(),
                 version=mcp_client.version,
             )
-        session = Session(ws, brain, trace, notes, mcp_client=mcp_client)
+        session = Session(
+            ws,
+            brain,
+            trace,
+            notes,
+            mcp_client=mcp_client,
+            environment_text=environment.prompt_text(unsafe=unsafe),
+            hooks=hooks,
+        )
         trace.log(
             "run_start",
             task_id=ws.task_id,
@@ -70,6 +111,8 @@ def run_session(
             base=ws.base,
             notes_chars=len(notes),
             mcp=mcp,
+            environment=dataclasses.asdict(environment),
+            environment_text=environment.describe(unsafe=unsafe),
         )
         print(
             f"--- Session {ws.task_id} (model: {getattr(brain, 'model', '?')}, branch: {ws.branch}) ---"
@@ -103,6 +146,7 @@ def run_session(
     finally:
         if mcp_client:
             mcp_client.close()  # stop the tool server before its worktree and container are removed
+        report_network(ws, trace)  # while the proxy still exists
         trace.log(
             "run_end",
             reason=reason,
@@ -120,7 +164,16 @@ def run_session(
     print("\n--- Session finished ---")
 
 
-def run_agent(repo_path, task, unsafe=False, network=False, brain=None, mcp=None):
+def run_agent(
+    repo_path,
+    task,
+    unsafe=False,
+    network=False,
+    brain=None,
+    mcp=None,
+    environment=None,
+    env_overrides=None,
+):
     """One request, then review (no follow-up prompts)."""
     run_session(
         repo_path,
@@ -130,7 +183,46 @@ def run_agent(repo_path, task, unsafe=False, network=False, brain=None, mcp=None
         brain=brain,
         interactive=False,
         mcp=mcp,
+        environment=environment,
+        env_overrides=env_overrides,
     )
+
+
+def repo_top(path):
+    """The root of the git repository that contains `path`, or None."""
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=path,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def report_network(ws, trace):
+    """Record and print what the egress proxy allowed and refused (network mode "registries")."""
+    try:
+        entries = ws.egress_entries()
+    except Exception:
+        return
+    allowed, blocked = summarize(entries)
+    if not allowed and not blocked:
+        return
+    trace.log("egress", allowed=allowed, blocked=blocked, entries=entries[-300:])
+    if allowed:
+        print("\n[network] allowed: " + ", ".join(f"{h} x{n}" for h, n in allowed.items()))
+    for note in blocked:
+        print(f"[network] BLOCKED {note}")
+
+
+def show_environment(repo_path, overrides):
+    """`--env`: print the sandbox settings that would be used, without running anything."""
+    environment = resolve_environment(repo_path, overrides, top=repo_top(repo_path))
+    print(environment.describe())
+    print("Image:", environment.image, "| project type:", environment.preset)
+    print("Told to the model:", environment.prompt_text())
+    if environment.network == "registries":
+        print("Allowed hosts:", ", ".join(environment.hosts()))
 
 
 def show_pending(ws):
@@ -233,15 +325,27 @@ def main():
             print(show(find_run(args[0], args[1] if len(args) == 2 else None)))
         except FileNotFoundError as e:
             print(e)
+    elif "--env" in flags and len(args) == 1:
+        try:
+            show_environment(args[0], flags_to_overrides(flags))
+        except RuntimeError as e:
+            print(f"Error: {e}")
     elif len(args) in (1, 2):
+        mcp_flags = [f for f in flags if f == "--mcp" or f.startswith("--mcp=")]
+        mcp_choice = None
+        if mcp_flags:
+            mcp_choice = mcp_flags[0].partition("=")[2] or "stdio"
+            if mcp_choice not in ("stdio", "http"):
+                print(f"Error: --mcp must be stdio or http, not {mcp_choice!r}")
+                return
         try:
             run_session(
                 args[0],
                 args[1] if len(args) == 2 else None,
                 unsafe="--unsafe-local" in flags,
-                network="--network" in flags,
                 interactive="--once" not in flags,
-                mcp="stdio" if "--mcp" in flags else None,
+                mcp=mcp_choice,
+                env_overrides=flags_to_overrides(flags),
             )
         except (
             RuntimeError
@@ -250,9 +354,13 @@ def main():
     else:
         print(
             "Usage:\n"
-            '  python -m ce_agent.main <repo_path> ["first request"] [--once] [--unsafe-local] [--network] [--mcp]\n'
+            '  python -m ce_agent.main <repo_path> ["first request"] [--once] [--unsafe-local] [--mcp[=http]]\n'
             "       starts a session; keep typing requests, Ctrl-D to finish and review. --once: do the request and stop\n"
-            "       --mcp: the workspace tools run in a separate MCP server process (stdio) instead of in-process\n"
+            "       --mcp[=stdio|http]: the workspace tools run in a separate MCP server process instead of in-process\n"
+            "       sandbox: --network[=none|registries|full]  --image=IMG  --memory=4g  --timeout=SECONDS  --pids=N\n"
+            "                --allow-host=HOST (repeatable)  --preset=rust|node|go|python  --no-cache\n"
+            "                (defaults come from the project's files and <repo>/.agent/env.json)\n"
+            "  python -m ce_agent.main <repo_path> --env              (show the sandbox settings that would be used)\n"
             "  python -m ce_agent.main <repo_path> --show [task_id]   (what did the agent do? default: latest run)\n"
             "  python -m ce_agent.main <repo_path> --cleanup          (after a crash; run only when no agent is running)"
         )

@@ -135,7 +135,7 @@ def tool_messages(brain):
 
 def test_the_agent_behaves_identically_in_process_and_over_mcp(tmp_path, monkeypatch):
     results = {}
-    for mode in (None, "stdio"):
+    for mode in (None, "stdio", "http"):
         repo = make_repo(tmp_path / f"repo_{mode}")
         brain = scripted_brain()
         typed(monkeypatch, "a")
@@ -147,6 +147,7 @@ def test_the_agent_behaves_identically_in_process_and_over_mcp(tmp_path, monkeyp
             "notes": (repo / "AGENTS.md").read_text(),
         }
     assert results["stdio"] == results[None]
+    assert results["http"] == results[None]
     assert len(results[None]["tool_results"]) == 11
     assert "ERROR" in results[None]["tool_results"][4] and "ERROR" in results[None]["tool_results"][8]    # both failures reached the model
     assert results[None]["calc"] == "def add(a, b):\n    return a - b\n"

@@ -40,7 +40,10 @@ def serve_stdio(server, stdin, stdout):
         line = line.strip()
         if not line:
             continue
-        reply = server.handle_line(line)
+        def notify(message):         # a running tool can send progress while the request is still being worked on
+            stdout.write(p.encode(message) + "\n")
+            stdout.flush()
+        reply = server.handle_line(line, notify=notify)
         if reply is not None:        # notifications get no reply
             stdout.write(reply + "\n")
             stdout.flush()
@@ -76,6 +79,7 @@ class StdioClient:
     def __init__(self, command, env=None, cwd=None, timeout=120, on_wire=None):
         self.command, self.env, self.cwd, self.timeout = command, env, cwd, timeout
         self.on_wire = on_wire              # optional: called as on_wire("send" | "recv", message) for every message
+        self.on_notification = None         # set by McpClient: called with every notification the server sends
         self.process = None
         self._lines = queue.Queue()
         self._stderr = collections.deque(maxlen=50)
@@ -105,10 +109,10 @@ class StdioClient:
         return "\n".join(self._stderr)
 
     def restart(self):
-        self.close()
+        self.close(grace=0.5)          # a server being restarted is broken or stuck: do not wait the full 3 s for it
         self.start()
 
-    def close(self):
+    def close(self, grace=3):
         """Shut down the way the spec says: close stdin, wait, then terminate, then kill."""
         process, self.process = self.process, None
         if process is None:
@@ -118,7 +122,7 @@ class StdioClient:
         except OSError:
             pass
         try:
-            process.wait(timeout=3)
+            process.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             process.terminate()
             try:
@@ -158,6 +162,11 @@ class StdioClient:
                 self.on_wire("recv", reply)
             if isinstance(reply, dict) and reply.get("id") == message["id"] and ("result" in reply or "error" in reply):
                 return reply
+            if isinstance(reply, dict) and "method" in reply and "id" not in reply and self.on_notification:
+                try:
+                    self.on_notification(reply)
+                except Exception:
+                    pass                       # a broken callback must not break the connection
 
     def _send(self, message):
         if self.on_wire:

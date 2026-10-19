@@ -55,7 +55,8 @@ def answer(monkeypatch, *choices):
 
 
 def test_agent_edits_runs_and_user_accepts(repo, monkeypatch):
-    brain = FakeBrain(tool_call("write_file", file_path="calc.py", content="print(2 + 2)\n"),
+    brain = FakeBrain(tool_call("read_file", file_path="calc.py"),                       # a careful model reads before it writes
+                      tool_call("write_file", file_path="calc.py", content="print(2 + 2)\n"),
                       tool_call("run_shell", command="python3 calc.py"),
                       final())
     answer(monkeypatch, "a")
@@ -63,10 +64,12 @@ def test_agent_edits_runs_and_user_accepts(repo, monkeypatch):
     assert (repo / "calc.py").read_text() == "print(2 + 2)\n"
 
 
-def test_reject_leaves_repo_alone(repo, monkeypatch):
-    brain = FakeBrain(tool_call("write_file", file_path="calc.py", content="oops\n"), final())
+def test_reject_leaves_repo_alone(repo, monkeypatch, capsys):
+    brain = FakeBrain(tool_call("read_file", file_path="calc.py"),
+                      tool_call("write_file", file_path="calc.py", content="oops\n"), final())
     answer(monkeypatch, "r")
     run_agent(str(repo), "change it", unsafe=True, brain=brain)
+    assert "Rejected. Your repo was not touched." in capsys.readouterr().out          # the agent really had changed something
     assert (repo / "calc.py").read_text() == "print(1 + 1)\n"
     assert "agent/" not in branches(repo)
 
